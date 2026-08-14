@@ -1,5 +1,5 @@
 import streamlit as st
-import fitz  # PyMuPDF
+import pymupdf  # Reemplazo oficial de fitz
 import pypdf
 import pandas as pd
 from nc_py_api import Nextcloud
@@ -16,7 +16,7 @@ import re
 # ==========================================
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name)
     return doc.write()
 
@@ -37,7 +37,7 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
         
     if not attachments:
         try:
-            doc_original = fitz.open(stream=pdf_bytes, filetype="pdf")
+            doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
             for name in doc_original.embfile_names():
                 attachments.append((name, doc_original.embfile_get(name)))
             doc_original.close()
@@ -68,7 +68,7 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        doc = fitz.open(temp_out_path)
+        doc = pymupdf.open(temp_out_path)
         if level == "3b" and attachments:
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name)
@@ -99,7 +99,7 @@ def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 def validate_pdfa(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     xml = doc.get_xml_metadata()
     if not xml:
         return False, "No es PDF/A (Sin metadatos XML)"
@@ -120,7 +120,7 @@ def get_attachments_info(pdf_bytes):
         pass
     if not names:
         try:
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
             names = list(doc.embfile_names())
             doc.close()
         except Exception:
@@ -153,7 +153,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         file_bytes = file_obj.read()
         
         try:
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            doc = pymupdf.open(stream=file_bytes, filetype="pdf")
             total_pages = len(doc)
             metadata = doc.metadata
             creation_date = metadata.get('creationDate', '')
@@ -188,7 +188,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v5.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v5.1", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -227,7 +227,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v5.0)")
+    st.title("📄 Herramienta de Preservación Documental (v5.1)")
     
     # ==========================================
     # LÓGICA PARA DOCUMENTOS INDIVIDUALES
