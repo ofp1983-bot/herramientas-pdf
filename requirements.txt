@@ -1,3 +1,6 @@
 streamlit
 PyMuPDF
 pypdf
+pandas
+openpyxl
+nc-py-api

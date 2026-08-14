@@ -1,6 +1,8 @@
 import streamlit as st
 import fitz  # PyMuPDF
-import pypdf # Librería para compatibilidad cruzada
+import pypdf
+import pandas as pd
+from nc_py_api import Nextcloud
 from io import BytesIO
 import hashlib
 import os
@@ -14,27 +16,16 @@ import re
 # ==========================================
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
-    """Anexa un archivo embebido a un PDF usando PyMuPDF."""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name)
     return doc.write()
 
 def convert_to_pdfa(pdf_bytes, level="2b"):
-    """
-    Convierte un PDF a PDF/A usando Ghostscript con depuración en vivo.
-    Tiene compatibilidad cruzada para anexos creados por pypdf y PyMuPDF.
-    """
     gs_cmd = "gswin64c" if os.name == "nt" else "gs"
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # =========================================================
-    # 1. BÚSQUEDA BILINGÜE DE ADJUNTOS
-    # =========================================================
-    st.write("🔍 **Debug Paso 1:** Analizando el documento con motor dual (pypdf + PyMuPDF)...")
     attachments = []
-    
-    # Motor 1: Intentar leer con pypdf
     try:
         reader = pypdf.PdfReader(BytesIO(pdf_bytes))
         if reader.attachments:
@@ -44,21 +35,15 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
     except Exception:
         pass
         
-    # Motor 2: Si pypdf no encontró nada, intentar con PyMuPDF
     if not attachments:
         try:
             doc_original = fitz.open(stream=pdf_bytes, filetype="pdf")
             for name in doc_original.embfile_names():
                 attachments.append((name, doc_original.embfile_get(name)))
             doc_original.close()
-        except Exception as e:
-            st.error(f"❌ Error al leer adjuntos: {e}")
-            
-    st.write(f"✅ **Debug Paso 2:** Se encontraron **{len(attachments)}** archivos adjuntos en la memoria.")
+        except Exception:
+            pass
     
-    # =========================================================
-    # 2. CONVERSIÓN CON GHOSTSCRIPT
-    # =========================================================
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -66,10 +51,6 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
     temp_out_path = temp_in_path.replace(".pdf", "_out.pdf")
     
     try:
-        if attachments:
-            st.info(f"🛠️ Procediendo a recodificar el documento y rescatar {len(attachments)} anexo(s)...")
-            
-        st.write("⚙️ **Debug Paso 3:** Enviando a Ghostscript para recodificación PDF/A...")
         cmd = [
             gs_cmd,
             "-dPDFA=" + part,
@@ -83,28 +64,15 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
         ]
         
         process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
         if process.returncode != 0:
-            st.error(f"❌ Fallo en Ghostscript. Detalles: {process.stderr if process.stderr.strip() else process.stdout}")
+            st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        st.write("✅ **Debug Paso 4:** Ghostscript terminó. Reconstruyendo documento...")
-        
-        # =========================================================
-        # 3. RE-INYECCIÓN Y METADATOS
-        # =========================================================
         doc = fitz.open(temp_out_path)
-        
-        # Re-inyectar adjuntos
         if level == "3b" and attachments:
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name)
-            st.write("✅ **Debug Paso 5:** Los anexos fueron re-inyectados al PDF final usando PyMuPDF.")
-            st.success("¡Documento ensamblado con éxito!")
-        elif level == "2b" and attachments:
-            st.warning("⚠️ Nota: Elegiste PDF/A-2b. Esta norma NO permite anexos. Los archivos embebidos han sido descartados definitivamente.")
         
-        # Inyectar metadatos XML
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -119,11 +87,9 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
         doc.set_xml_metadata(xml_metadata)
         pdfa_bytes = doc.write()
         doc.close()
-            
         return pdfa_bytes
-        
     except Exception as e:
-        st.error(f"❌ Error inesperado: {str(e)}")
+        st.error(f"Error: {str(e)}")
         return None
     finally:
         if os.path.exists(temp_in_path): os.remove(temp_in_path)
@@ -137,19 +103,14 @@ def validate_pdfa(pdf_bytes):
     xml = doc.get_xml_metadata()
     if not xml:
         return False, "No es PDF/A (Sin metadatos XML)"
-    
     part_match = re.search(r'<pdfaid:part>(\d)</pdfaid:part>', xml)
     conf_match = re.search(r'<pdfaid:conformance>([A-Z]+)</pdfaid:conformance>', xml)
-    
     if part_match and conf_match:
         return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)}"
-    
     return False, "No detectado"
 
-def get_attachments_names(pdf_bytes):
-    """Extrae los nombres de los archivos adjuntos usando un motor dual."""
+def get_attachments_info(pdf_bytes):
     names = []
-    # Motor 1: pypdf
     try:
         reader = pypdf.PdfReader(BytesIO(pdf_bytes))
         if reader.attachments:
@@ -157,8 +118,6 @@ def get_attachments_names(pdf_bytes):
                 names.append(name)
     except Exception:
         pass
-        
-    # Motor 2: PyMuPDF (si pypdf no encontró nada)
     if not names:
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -166,95 +125,230 @@ def get_attachments_names(pdf_bytes):
             doc.close()
         except Exception:
             pass
-    
-    # Retorna la lista de nombres sin duplicados
     return list(set(names))
 
 def generate_report(file_name, file_bytes):
     sha256_hash = get_file_hash(file_bytes)
     size_kb = len(file_bytes) / 1024
     is_valid, pdfa_level = validate_pdfa(file_bytes)
+    nombres_anexos = get_attachments_info(file_bytes)
     
-    # Búsqueda de anexos para el informe
-    nombres_anexos = get_attachments_names(file_bytes)
-    estado_anexos = "Sí" if nombres_anexos else "No"
-    texto_nombres_anexos = ", ".join(nombres_anexos) if nombres_anexos else "N/A"
-    
-    report = {
+    return {
         "Nombre del Archivo": file_name,
         "Hash SHA-256": sha256_hash,
         "Tamaño": f"{size_kb:.2f} KB",
         "Fecha de Análisis": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Cumplimiento PDF/A": "Válido" if is_valid else "No Cumple",
         "Nivel PDF/A Detectado": pdfa_level,
-        "Contiene Anexos": estado_anexos,
-        "Nombre de los Anexos": texto_nombres_anexos
+        "Contiene Anexos": "Sí" if nombres_anexos else "No",
+        "Nombre de los Anexos": ", ".join(nombres_anexos) if nombres_anexos else "N/A"
     }
-    return report
+
+def generate_electronic_index(archivos, origen_default="Digitalizado"):
+    """Procesa un lote de PDFs y genera un DataFrame con el índice electrónico."""
+    index_data = []
+    fecha_incorporacion = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    for idx, file_obj in enumerate(archivos, start=1):
+        file_bytes = file_obj.read()
+        
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            total_pages = len(doc)
+            metadata = doc.metadata
+            creation_date = metadata.get('creationDate', '')
+            doc.close()
+        except Exception:
+            total_pages = 0
+            creation_date = "Desconocida"
+            
+        sha256_hash = get_file_hash(file_bytes)
+        size_kb = len(file_bytes) / 1024
+        
+        row = {
+            "Id": f"DOC-{idx:03d}",
+            "Nombre_Documento": file_obj.name,
+            "Tipologia_Documental": "Documento General",
+            "Fecha_Creacion_Documento": creation_date,
+            "Fecha_Incorporacion_Expediente": fecha_incorporacion,
+            "Valor_Huella": sha256_hash,
+            "Funcion_Resumen": "SHA-256",
+            "Orden_Documento_Expediente": idx,
+            "Pagina_Inicio": 1 if total_pages > 0 else 0,
+            "Pagina_Fin": total_pages,
+            "Formato": "PDF",
+            "Tamano": f"{size_kb:.2f} KB",
+            "Origen": origen_default
+        }
+        index_data.append(row)
+        
+    return pd.DataFrame(index_data)
 
 # ==========================================
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor PDF v3.1", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v5.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
 with col_menu:
-    st.markdown("### ⚙️ Menú de Tareas")
-    menu_option = st.radio(
-        "Selecciona una acción:",
-        (
-            "1. Anexar Excel a PDF",
-            "2. Adjuntar Cualquier Archivo",
-            "3. Convertir a PDF/A-2b",
-            "4. Convertir a PDF/A-3b",
-            "5. Generar Informe de Preservación"
-        )
+    st.markdown("### ⚙️ Menú Principal")
+    
+    # 1. Selector de Módulo Principal
+    modulo = st.selectbox(
+        "Selecciona el módulo de trabajo:",
+        ["📄 Documentos Individuales", "📁 Procesamiento por Lotes"]
     )
+    
+    st.markdown("---")
+    
+    # 2. Sub-menú dependiente del módulo elegido
+    if modulo == "📄 Documentos Individuales":
+        st.markdown("#### Tareas Individuales")
+        menu_option = st.radio(
+            "Acción a realizar:",
+            (
+                "1. Anexar Excel a PDF",
+                "2. Adjuntar Cualquier Archivo",
+                "3. Convertir a PDF/A-2b",
+                "4. Convertir a PDF/A-3b",
+                "5. Generar Informe de Preservación"
+            )
+        )
+    else:
+        st.markdown("#### Creación de Índices")
+        menu_option = st.radio(
+            "Origen de los archivos:",
+            (
+                "1. Subir archivos manualmente",
+                "2. Conectar a Aurora Nextcloud"
+            )
+        )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación PDF (v3.1)")
-    st.write("Sube tu documento principal y selecciona una acción.")
+    st.title("📄 Herramienta de Preservación Documental (v5.0)")
     
-    main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
+    # ==========================================
+    # LÓGICA PARA DOCUMENTOS INDIVIDUALES
+    # ==========================================
+    if modulo == "📄 Documentos Individuales":
+        main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
+        
+        if main_pdf is not None:
+            pdf_bytes = main_pdf.read()
 
-    if main_pdf is not None:
-        pdf_bytes = main_pdf.read()
+            if "1. Anexar" in menu_option or "2. Adjuntar" in menu_option:
+                st.subheader(menu_option)
+                allowed = ["xlsx", "xls"] if "Excel" in menu_option else None
+                attachment = st.file_uploader("Sube el archivo a adjuntar", type=allowed)
+                
+                if attachment and st.button("Embeber Archivo"):
+                    with st.spinner("Embebiendo archivo..."):
+                        result_pdf = embed_file_in_pdf(pdf_bytes, attachment.read(), attachment.name)
+                        st.success("¡Archivo adjuntado con éxito!")
+                        st.download_button("Descargar PDF con Anexo", result_pdf, file_name=f"con_anexo_{main_pdf.name}", mime="application/pdf")
 
-        if "1. Anexar" in menu_option or "2. Adjuntar" in menu_option:
-            st.subheader(menu_option)
-            allowed = ["xlsx", "xls"] if "Excel" in menu_option else None
-            attachment = st.file_uploader("Sube el archivo a adjuntar", type=allowed)
+            elif "Convertir a PDF/A" in menu_option:
+                st.subheader(menu_option)
+                level = "3b" if "3b" in menu_option else "2b"
+                if st.button(f"Ejecutar Conversión a {level}"):
+                    with st.spinner("Procesando conversión..."):
+                        result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
+                        if result_pdfa:
+                            st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
+
+            elif "5. Generar Informe" in menu_option:
+                st.subheader("📊 Informe de Preservación")
+                if st.button("Ejecutar Análisis"):
+                    with st.spinner("Analizando..."):
+                        report = generate_report(main_pdf.name, pdf_bytes)
+                        for k, v in report.items():
+                            st.markdown(f"**{k}:** {v}")
+                        report_text = "\n".join([f"{k}: {v}" for k, v in report.items()])
+                        st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
+
+    # ==========================================
+    # LÓGICA PARA PROCESAMIENTO POR LOTES
+    # ==========================================
+    else:
+        st.subheader("📁 Índice Electrónico de Expedientes")
+        
+        # OPCIÓN LOTES 1: Subida Manual
+        if "Subir archivos" in menu_option:
+            st.write("Selecciona o arrastra múltiples archivos PDF desde tu equipo.")
+            origen_opcion = st.selectbox("Origen predeterminado:", ["Digitalizado", "Electrónico", "Físico"], key="orig_manual")
+            batch_files = st.file_uploader("Sube los archivos PDF del expediente", type=["pdf"], accept_multiple_files=True)
             
-            if attachment and st.button("Embeber Archivo"):
-                with st.spinner("Embebiendo archivo..."):
-                    result_pdf = embed_file_in_pdf(pdf_bytes, attachment.read(), attachment.name)
-                    st.success("¡Archivo adjuntado con éxito!")
-                    st.download_button(label="Descargar PDF con Anexo", data=result_pdf, file_name=f"con_anexo_{main_pdf.name}", mime="application/pdf")
-
-        elif "Convertir a PDF/A" in menu_option:
-            st.subheader(menu_option)
-            level = "3b" if "3b" in menu_option else "2b"
-            
-            if st.button(f"Ejecutar Conversión a {level}"):
-                with st.spinner("Procesando conversión..."):
-                    result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
-                    if result_pdfa:
-                        st.download_button(label=f"Descargar PDF/A-{level}", data=result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
-
-        elif "5. Generar Informe" in menu_option:
-            st.subheader("📊 Informe de Preservación")
-            if st.button("Ejecutar Análisis"):
-                with st.spinner("Analizando..."):
-                    report = generate_report(main_pdf.name, pdf_bytes)
-                    for key, value in report.items():
-                        st.markdown(f"**{key}:** {value}")
+            if batch_files:
+                st.info(f"Se han cargado {len(batch_files)} archivos para procesar.")
+                if st.button("Generar Índice en Excel"):
+                    with st.spinner("Procesando lote y calculando hashes SHA-256..."):
+                        df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
+                        st.dataframe(df_index)
                         
-                    report_text = "\n".join([f"{k}: {v}" for k, v in report.items()])
-                    st.download_button(
-                        label="Descargar Informe (.txt)",
-                        data=report_text,
-                        file_name=f"informe_{main_pdf.name}.txt",
-                        mime="text/plain"
-                    )
+                        output = BytesIO()
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
+                        
+                        st.success("¡Índice electrónico generado con éxito!")
+                        st.download_button(
+                            label="📥 Descargar Índice Electrónico (.xlsx)",
+                            data=output.getvalue(),
+                            file_name="indice_electronico_manual.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                        
+        # OPCIÓN LOTES 2: Aurora Nextcloud
+        elif "Aurora Nextcloud" in menu_option:
+            st.write("Conéctate directamente al repositorio en la nube para indexar el expediente sin descargar los archivos localmente.")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                nc_url = st.text_input("URL del Servidor", value="https://aurora.midominio.com")
+                nc_user = st.text_input("Usuario Nextcloud")
+            with col2:
+                nc_pass = st.text_input("Contraseña de Aplicación", type="password", help="Genera esta contraseña en la configuración de seguridad de Nextcloud.")
+                nc_folder = st.text_input("Ruta de la carpeta", placeholder="/Expedientes/2026/Contrato_01")
+                
+            origen_opcion = st.selectbox("Origen predeterminado:", ["Electrónico", "Digitalizado", "Físico"], key="orig_cloud")
+            
+            if st.button("Conectar y Generar Índice"):
+                if not all([nc_url, nc_user, nc_pass, nc_folder]):
+                    st.warning("⚠️ Por favor, completa todos los campos de conexión.")
+                else:
+                    with st.spinner("Conectando con Aurora Nextcloud..."):
+                        try:
+                            nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
+                            nodos = nc.files.listdir(nc_folder)
+                            archivos_pdf = [nodo for nodo in nodos if nodo.name.lower().endswith('.pdf')]
+                            
+                            if not archivos_pdf:
+                                st.error("No se encontraron archivos PDF en la ruta especificada.")
+                            else:
+                                st.info(f"✅ Conexión exitosa. Extrayendo metadatos de {len(archivos_pdf)} documentos...")
+                                
+                                batch_files = []
+                                for pdf_node in archivos_pdf:
+                                    contenido_bytes = nc.files.download(pdf_node)
+                                    archivo_en_memoria = BytesIO(contenido_bytes)
+                                    archivo_en_memoria.name = pdf_node.name 
+                                    batch_files.append(archivo_en_memoria)
+                                
+                                df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
+                                st.dataframe(df_index)
+                                
+                                output = BytesIO()
+                                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                    df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
+                                
+                                st.success("¡Índice electrónico generado con éxito desde Aurora Nextcloud!")
+                                st.download_button(
+                                    label="📥 Descargar Índice Electrónico (.xlsx)",
+                                    data=output.getvalue(),
+                                    file_name="indice_aurora_nextcloud.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+                        except Exception as e:
+                            st.error(f"❌ Error de conexión o lectura: {str(e)}")
+                            st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta de la carpeta empiece con '/'")
