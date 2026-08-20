@@ -159,68 +159,83 @@ def generate_report(file_name, file_bytes):
     }
 
 def generate_electronic_index(archivos, origen_default="Digitalizado"):
-    """Procesa un lote de PDFs, los ordena cronológicamente y genera un DataFrame con el índice electrónico."""
+    """Procesa un lote multiformato, ordena cronológicamente y genera el DataFrame."""
     temp_docs = []
     
-    # FASE 1: Extracción de metadatos de todos los archivos
     for file_obj in archivos:
         file_bytes = file_obj.read()
+        file_name = file_obj.name
         
-        # Extracción de PDF/A y Anexos
-        is_valid, pdfa_level = validate_pdfa(file_bytes)
-        nombres_anexos = get_attachments_info(file_bytes)
+        # Extraer nombre sin extensión para la Tipología y formato para la columna Formato
+        tipologia_nombre = os.path.splitext(file_name)[0]
+        extension = os.path.splitext(file_name)[1].lower()
+        formato_str = extension.replace(".", "").upper() if extension else "DESCONOCIDO"
         
-        tiene_anexos = "Sí" if nombres_anexos else "No"
-        nombres_anexos_str = ", ".join(nombres_anexos) if nombres_anexos else "N/A"
+        # Variables por defecto para formatos que NO son PDF
+        total_pages = 0
+        creation_date = "Desconocida"
+        pdfa_final = "N/A"
+        tiene_anexos = "N/A"
+        tipos_anexos_str = "N/A"
+        nombres_anexos_str = "N/A"
         
-        # Extraer extensiones para el "Tipo de anexo" (ej. .XLSX, .XML)
-        tipos_anexos = list(set([os.path.splitext(name)[1].upper() for name in nombres_anexos if os.path.splitext(name)[1]]))
-        tipos_anexos_str = ", ".join(tipos_anexos) if tipos_anexos else "N/A"
-        
-        try:
-            doc = pymupdf.open(stream=file_bytes, filetype="pdf")
-            total_pages = len(doc)
-            metadata = doc.metadata
-            raw_creation_date = metadata.get('creationDate', '')
-            creation_date = parse_pdf_date(raw_creation_date)
-            doc.close()
-        except Exception:
-            total_pages = 0
-            creation_date = "Desconocida"
+        # Procesamiento exclusivo si el archivo es PDF
+        if extension == ".pdf":
+            is_valid, pdfa_level = validate_pdfa(file_bytes)
+            pdfa_final = pdfa_level if is_valid else "No detectado"
             
-        # Objeto fecha temporal para usar en el ordenamiento interno
+            nombres_anexos = get_attachments_info(file_bytes)
+            tiene_anexos = "Sí" if nombres_anexos else "No"
+            if nombres_anexos:
+                nombres_anexos_str = ", ".join(nombres_anexos)
+                tipos_anexos = list(set([os.path.splitext(n)[1].upper() for n in nombres_anexos if os.path.splitext(n)[1]]))
+                tipos_anexos_str = ", ".join(tipos_anexos) if tipos_anexos else "N/A"
+            
+            try:
+                doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+                total_pages = len(doc)
+                metadata = doc.metadata
+                raw_creation_date = metadata.get('creationDate', '')
+                creation_date = parse_pdf_date(raw_creation_date)
+                doc.close()
+            except Exception:
+                pass
+                
+        # Objeto fecha para ordenar (si es desconocida, va al final)
         try:
             date_obj = datetime.strptime(creation_date, "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            date_obj = datetime.max # Si no hay fecha, se envían al final del índice
+            date_obj = datetime.max 
             
         sha256_hash = get_file_hash(file_bytes)
         size_kb = len(file_bytes) / 1024
         
         temp_docs.append({
-            "Nombre_Documento": file_obj.name,
+            "Nombre_Documento": file_name,
+            "Tipologia_Documental": tipologia_nombre,
             "creation_date_str": creation_date,
-            "date_obj": date_obj, # Campo oculto solo para ordenar
+            "date_obj": date_obj, 
             "Valor_Huella": sha256_hash,
             "Pagina_Inicio": 1 if total_pages > 0 else 0,
-            "Pagina_Fin": total_pages,
+            "Pagina_Fin": total_pages if total_pages > 0 else "N/A",
+            "Formato": formato_str,
             "Tamano": f"{size_kb:.2f} KB",
-            "Tipo_PDFA": pdfa_level if is_valid else "No detectado",
+            "Tipo_PDFA": pdfa_final,
             "Tiene_Anexos": tiene_anexos,
             "Tipo_Anexo": tipos_anexos_str,
             "Nombre_Anexo": nombres_anexos_str
         })
         
-    # FASE 2: Ordenamiento Cronológico (Ascendente)
+    # Ordenamiento Cronológico (Ascendente)
     temp_docs.sort(key=lambda x: x["date_obj"])
     
-    # FASE 3: Asignación de ID y estructuración del DataFrame
+    # Asignación de ID y construcción de filas
     index_data = []
     for idx, item in enumerate(temp_docs, start=1):
         row = {
             "Id": f"DOC-{idx:03d}",
             "Nombre_Documento": item["Nombre_Documento"],
-            "Tipologia_Documental": "Documento General",
+            "Tipologia_Documental": item["Tipologia_Documental"],
             "Fecha_Creacion_Documento": item["creation_date_str"],
             "Fecha_Incorporacion_Expediente": item["creation_date_str"],
             "Valor_Huella": item["Valor_Huella"],
@@ -228,7 +243,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
             "Orden_Documento_Expediente": idx,
             "Pagina_Inicio": item["Pagina_Inicio"],
             "Pagina_Fin": item["Pagina_Fin"],
-            "Formato": "PDF",
+            "Formato": item["Formato"],
             "Tamano": item["Tamano"],
             "Origen": origen_default,
             "Tipo_PDFA": item["Tipo_PDFA"],
@@ -244,7 +259,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v5.4", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v6.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -281,7 +296,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v5.4)")
+    st.title("📄 Herramienta de Preservación Documental (v6.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -320,12 +335,13 @@ with col_main:
                         st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
 
     else:
-        st.subheader("📁 Índice Electrónico de Expedientes")
+        st.subheader("📁 Índice Electrónico de Expedientes Multiformato")
         
         if "Subir archivos" in menu_option:
-            st.write("Selecciona o arrastra múltiples archivos PDF desde tu equipo.")
+            st.write("Selecciona o arrastra múltiples archivos de cualquier formato desde tu equipo.")
             origen_opcion = st.selectbox("Origen predeterminado:", ["Digitalizado", "Electrónico", "Físico"], key="orig_manual")
-            batch_files = st.file_uploader("Sube los archivos PDF del expediente", type=["pdf"], accept_multiple_files=True)
+            # Se quitó la restricción type=["pdf"] para permitir Word, Excel, etc.
+            batch_files = st.file_uploader("Sube los archivos del expediente", accept_multiple_files=True)
             
             if batch_files:
                 st.info(f"Se han cargado {len(batch_files)} archivos para procesar.")
@@ -342,19 +358,19 @@ with col_main:
                         st.download_button(
                             label="📥 Descargar Índice Electrónico (.xlsx)",
                             data=output.getvalue(),
-                            file_name="indice_electronico_ordenado.xlsx",
+                            file_name="indice_electronico_multiformato.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         )
                         
         elif "Aurora Nextcloud" in menu_option:
-            st.write("Conéctate directamente al repositorio en la nube para indexar el expediente sin descargar los archivos localmente.")
+            st.write("Conéctate al repositorio en la nube para indexar el expediente (incluye todos los formatos).")
             
             col1, col2 = st.columns(2)
             with col1:
                 nc_url = st.text_input("URL del Servidor", value="https://cloud.insdeportescajica.gov.co")
                 nc_user = st.text_input("Usuario Nextcloud")
             with col2:
-                nc_pass = st.text_input("Contraseña de Aplicación", type="password", help="Genera esta contraseña en la configuración de seguridad de Nextcloud.")
+                nc_pass = st.text_input("Contraseña de Aplicación", type="password")
                 nc_folder = st.text_input("Ruta de la carpeta", placeholder="/Expedientes/2026/Contrato_01")
                 
             origen_opcion = st.selectbox("Origen predeterminado:", ["Electrónico", "Digitalizado", "Físico"], key="orig_cloud")
@@ -367,18 +383,20 @@ with col_main:
                         try:
                             nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
                             nodos = nc.files.listdir(nc_folder)
-                            archivos_pdf = [nodo for nodo in nodos if nodo.name.lower().endswith('.pdf')]
                             
-                            if not archivos_pdf:
-                                st.error("No se encontraron archivos PDF en la ruta especificada.")
+                            # Filtramos todo lo que sea un archivo (ignoramos subcarpetas)
+                            archivos_lote = [nodo for nodo in nodos if not nodo.is_dir]
+                            
+                            if not archivos_lote:
+                                st.error("No se encontraron archivos en la ruta especificada.")
                             else:
-                                st.info(f"✅ Conexión exitosa. Extrayendo metadatos de {len(archivos_pdf)} documentos (esto puede tardar unos momentos)...")
+                                st.info(f"✅ Conexión exitosa. Extrayendo metadatos de {len(archivos_lote)} documentos (todos los formatos)...")
                                 
                                 batch_files = []
-                                for pdf_node in archivos_pdf:
-                                    contenido_bytes = nc.files.download(pdf_node)
+                                for node in archivos_lote:
+                                    contenido_bytes = nc.files.download(node)
                                     archivo_en_memoria = BytesIO(contenido_bytes)
-                                    archivo_en_memoria.name = pdf_node.name 
+                                    archivo_en_memoria.name = node.name 
                                     batch_files.append(archivo_en_memoria)
                                 
                                 df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
@@ -388,13 +406,13 @@ with col_main:
                                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                                     df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                                 
-                                st.success("¡Índice electrónico ordenado y generado con éxito desde Aurora Nextcloud!")
+                                st.success("¡Índice electrónico multiformato generado con éxito desde Aurora Nextcloud!")
                                 st.download_button(
                                     label="📥 Descargar Índice Electrónico (.xlsx)",
                                     data=output.getvalue(),
-                                    file_name="indice_aurora_nextcloud_ordenado.xlsx",
+                                    file_name="indice_aurora_nextcloud_multiformato.xlsx",
                                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                                 )
                         except Exception as e:
                             st.error(f"❌ Error de conexión o lectura: {str(e)}")
-                            st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta de la carpeta empiece con '/'")
+                            st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta exista.")
