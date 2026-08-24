@@ -253,7 +253,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v7.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v7.1", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -290,7 +290,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v7.0)")
+    st.title("📄 Herramienta de Preservación Documental (v7.1)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -343,13 +343,12 @@ with col_main:
                         df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
                         st.dataframe(df_index)
                         
-                        # Generación de Excel
                         output_excel = BytesIO()
                         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                             df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                         
-                        # Generación de XML
-                        xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento")
+                        # CORRECCIÓN AQUÍ: parser="etree"
+                        xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
                         
                         st.success("¡Índices electrónicos generados con éxito!")
                         
@@ -408,13 +407,12 @@ with col_main:
                                 df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
                                 st.dataframe(df_index)
                                 
-                                # Generación de Excel
                                 output_excel = BytesIO()
                                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                                     df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                                 
-                                # Generación de XML
-                                xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento")
+                                # CORRECCIÓN AQUÍ: parser="etree"
+                                xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
                                 
                                 st.success("¡Índices electrónicos generados con éxito desde Aurora Nextcloud!")
                                 
