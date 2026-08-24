@@ -166,12 +166,10 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         file_bytes = file_obj.read()
         file_name = file_obj.name
         
-        # Extraer nombre sin extensión para la Tipología y formato para la columna Formato
         tipologia_nombre = os.path.splitext(file_name)[0]
         extension = os.path.splitext(file_name)[1].lower()
         formato_str = extension.replace(".", "").upper() if extension else "DESCONOCIDO"
         
-        # Variables por defecto para formatos que NO son PDF
         total_pages = 0
         creation_date = "Desconocida"
         pdfa_final = "N/A"
@@ -179,7 +177,6 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         tipos_anexos_str = "N/A"
         nombres_anexos_str = "N/A"
         
-        # Procesamiento exclusivo si el archivo es PDF
         if extension == ".pdf":
             is_valid, pdfa_level = validate_pdfa(file_bytes)
             pdfa_final = pdfa_level if is_valid else "No detectado"
@@ -201,7 +198,6 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
             except Exception:
                 pass
                 
-        # Objeto fecha para ordenar (si es desconocida, va al final)
         try:
             date_obj = datetime.strptime(creation_date, "%Y-%m-%d %H:%M:%S")
         except ValueError:
@@ -226,10 +222,8 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
             "Nombre_Anexo": nombres_anexos_str
         })
         
-    # Ordenamiento Cronológico (Ascendente)
     temp_docs.sort(key=lambda x: x["date_obj"])
     
-    # Asignación de ID y construcción de filas
     index_data = []
     for idx, item in enumerate(temp_docs, start=1):
         row = {
@@ -259,7 +253,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v6.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v7.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -296,7 +290,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v6.0)")
+    st.title("📄 Herramienta de Preservación Documental (v7.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -340,27 +334,40 @@ with col_main:
         if "Subir archivos" in menu_option:
             st.write("Selecciona o arrastra múltiples archivos de cualquier formato desde tu equipo.")
             origen_opcion = st.selectbox("Origen predeterminado:", ["Digitalizado", "Electrónico", "Físico"], key="orig_manual")
-            # Se quitó la restricción type=["pdf"] para permitir Word, Excel, etc.
             batch_files = st.file_uploader("Sube los archivos del expediente", accept_multiple_files=True)
             
             if batch_files:
                 st.info(f"Se han cargado {len(batch_files)} archivos para procesar.")
-                if st.button("Generar Índice en Excel"):
+                if st.button("Generar Índice"):
                     with st.spinner("Procesando lote, ordenando por fecha y extrayendo metadatos..."):
                         df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
                         st.dataframe(df_index)
                         
-                        output = BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        # Generación de Excel
+                        output_excel = BytesIO()
+                        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                             df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                         
-                        st.success("¡Índice electrónico generado con éxito!")
-                        st.download_button(
-                            label="📥 Descargar Índice Electrónico (.xlsx)",
-                            data=output.getvalue(),
-                            file_name="indice_electronico_multiformato.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                        # Generación de XML
+                        xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento")
+                        
+                        st.success("¡Índices electrónicos generados con éxito!")
+                        
+                        col_btn1, col_btn2 = st.columns(2)
+                        with col_btn1:
+                            st.download_button(
+                                label="📥 Descargar Índice (.xlsx)",
+                                data=output_excel.getvalue(),
+                                file_name="indice_electronico_multiformato.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
+                        with col_btn2:
+                            st.download_button(
+                                label="📥 Descargar Índice (.xml)",
+                                data=xml_data.encode('utf-8'),
+                                file_name="indice_electronico_multiformato.xml",
+                                mime="application/xml"
+                            )
                         
         elif "Aurora Nextcloud" in menu_option:
             st.write("Conéctate al repositorio en la nube para indexar el expediente (incluye todos los formatos).")
@@ -384,13 +391,12 @@ with col_main:
                             nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
                             nodos = nc.files.listdir(nc_folder)
                             
-                            # Filtramos todo lo que sea un archivo (ignoramos subcarpetas)
                             archivos_lote = [nodo for nodo in nodos if not nodo.is_dir]
                             
                             if not archivos_lote:
                                 st.error("No se encontraron archivos en la ruta especificada.")
                             else:
-                                st.info(f"✅ Conexión exitosa. Extrayendo metadatos de {len(archivos_lote)} documentos (todos los formatos)...")
+                                st.info(f"✅ Conexión exitosa. Extrayendo metadatos de {len(archivos_lote)} documentos...")
                                 
                                 batch_files = []
                                 for node in archivos_lote:
@@ -402,17 +408,31 @@ with col_main:
                                 df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
                                 st.dataframe(df_index)
                                 
-                                output = BytesIO()
-                                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                                # Generación de Excel
+                                output_excel = BytesIO()
+                                with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                                     df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                                 
-                                st.success("¡Índice electrónico multiformato generado con éxito desde Aurora Nextcloud!")
-                                st.download_button(
-                                    label="📥 Descargar Índice Electrónico (.xlsx)",
-                                    data=output.getvalue(),
-                                    file_name="indice_aurora_nextcloud_multiformato.xlsx",
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                )
+                                # Generación de XML
+                                xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento")
+                                
+                                st.success("¡Índices electrónicos generados con éxito desde Aurora Nextcloud!")
+                                
+                                col_btn1, col_btn2 = st.columns(2)
+                                with col_btn1:
+                                    st.download_button(
+                                        label="📥 Descargar Índice (.xlsx)",
+                                        data=output_excel.getvalue(),
+                                        file_name="indice_aurora_nextcloud.xlsx",
+                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                    )
+                                with col_btn2:
+                                    st.download_button(
+                                        label="📥 Descargar Índice (.xml)",
+                                        data=xml_data.encode('utf-8'),
+                                        file_name="indice_aurora_nextcloud.xml",
+                                        mime="application/xml"
+                                    )
                         except Exception as e:
                             st.error(f"❌ Error de conexión o lectura: {str(e)}")
                             st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta exista.")
