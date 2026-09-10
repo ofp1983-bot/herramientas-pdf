@@ -26,30 +26,37 @@ def parse_pdf_date(date_str):
     return str(date_str) 
 
 def fix_pdfa_attachment_dictionaries(doc):
-    """Inyecta etiquetas estructurales y el arreglo /AF en el Catálogo maestro para cumplir con PDF/A-3b"""
+    """Inyecta etiquetas estructurales blindadas para cumplir con las reglas 6.8-3 y 6.8-4 de PDF/A-3b"""
     catalog_xref = doc.pdf_catalog()
     af_xrefs = []
     
     for xref in range(1, doc.xref_length()):
         try:
-            # 1. Detectar el diccionario FileSpecification buscando la clave /EF (EmbeddedFile)
-            ef_key = doc.xref_get_key(xref, "EF")
-            if ef_key[0] != "null":
-                # Forzar el AFRelationship exigido por la Cláusula 6.8
+            # Escanear TODAS las claves del objeto, sin depender del /Type
+            keys = doc.xref_get_keys(xref)
+            
+            # 1. Detectar diccionarios FileSpec buscando la presencia de EF (EmbeddedFile) y F (File)
+            if "EF" in keys and ("F" in keys or "UF" in keys):
+                # Regla 6.8-3: Forzar la relación obligatoria
                 doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
+                # Forzar explícitamente el tipo para que Acrobat no dude
+                doc.xref_set_key(xref, "Type", "/Filespec")
+                
                 af_xrefs.append(xref)
             
-            # 2. Detectar el stream de datos crudos para forzar el MIME Type
-            type_key = doc.xref_get_key(xref, "Type")
-            if type_key[1] == "/EmbeddedFile":
-                subtype_key = doc.xref_get_key(xref, "Subtype")
-                if subtype_key[0] == "null":
-                    doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
+            # 2. Detectar streams de datos para forzar Subtype MIME (Previene errores 6.9)
+            if "Type" in keys:
+                type_val = doc.xref_get_key(xref, "Type")
+                if type_val[1] == "/EmbeddedFile":
+                    if "Subtype" not in keys:
+                        doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
         except Exception:
             continue
             
-    # 3. Registrar oficialmente los anexos en el Catálogo como Archivos Asociados (/AF)
+    # 3. Regla 6.8-4: Registrar oficialmente en el Catálogo como Archivos Asociados (/AF)
     if af_xrefs:
+        # Eliminar duplicados por seguridad
+        af_xrefs = list(set(af_xrefs))
         af_array = "[ " + " ".join([f"{x} 0 R" for x in af_xrefs]) + " ]"
         doc.xref_set_key(catalog_xref, "AF", af_array)
 
@@ -284,7 +291,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v8.2", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v8.3", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -321,7 +328,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v8.2)")
+    st.title("📄 Herramienta de Preservación Documental (v8.3)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
