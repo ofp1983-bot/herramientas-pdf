@@ -26,22 +26,32 @@ def parse_pdf_date(date_str):
     return str(date_str) 
 
 def fix_pdfa_attachment_dictionaries(doc):
-    """Inyecta etiquetas de bajo nivel para cumplir con las reglas de VeraPDF (6.9-1 y 6.9-4) y visualizar en Acrobat"""
+    """Inyecta etiquetas estructurales y el arreglo /AF en el Catálogo maestro para cumplir con PDF/A-3b"""
+    catalog_xref = doc.pdf_catalog()
+    af_xrefs = []
+    
     for xref in range(1, doc.xref_length()):
         try:
-            type_val = doc.xref_get_key(xref, "Type")
-            
-            # Regla 6.9-4: AFRelationship en el FileSpec
-            if type_val and type_val[1] == "/Filespec":
+            # 1. Detectar el diccionario FileSpecification buscando la clave /EF (EmbeddedFile)
+            ef_key = doc.xref_get_key(xref, "EF")
+            if ef_key[0] != "null":
+                # Forzar el AFRelationship exigido por la Cláusula 6.8
                 doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
+                af_xrefs.append(xref)
             
-            # Regla 6.9-1: Subtype (MIME) en el EmbeddedFile
-            elif type_val and type_val[1] == "/EmbeddedFile":
-                subtype_val = doc.xref_get_key(xref, "Subtype")
-                if subtype_val and subtype_val[0] == "null":
+            # 2. Detectar el stream de datos crudos para forzar el MIME Type
+            type_key = doc.xref_get_key(xref, "Type")
+            if type_key[1] == "/EmbeddedFile":
+                subtype_key = doc.xref_get_key(xref, "Subtype")
+                if subtype_key[0] == "null":
                     doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
         except Exception:
             continue
+            
+    # 3. Registrar oficialmente los anexos en el Catálogo como Archivos Asociados (/AF)
+    if af_xrefs:
+        af_array = "[ " + " ".join([f"{x} 0 R" for x in af_xrefs]) + " ]"
+        doc.xref_set_key(catalog_xref, "AF", af_array)
 
 # ==========================================
 # FUNCIONES PRINCIPALES
@@ -106,7 +116,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name)
             
-            # Aplicar inyección estructural de metadatos internos
+            # Ejecutar el re-ensamblaje estructural profundo
             fix_pdfa_attachment_dictionaries(doc)
         
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
@@ -274,7 +284,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v8.1", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v8.2", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -311,7 +321,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v8.1)")
+    st.title("📄 Herramienta de Preservación Documental (v8.2)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
