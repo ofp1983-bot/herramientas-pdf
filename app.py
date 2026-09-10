@@ -1,5 +1,5 @@
 import streamlit as st
-import pymupdf  # Reemplazo oficial de fitz
+import pymupdf  
 import pypdf
 import pandas as pd
 from nc_py_api import Nextcloud
@@ -34,10 +34,20 @@ def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name)
     return doc.write()
 
-def convert_to_pdfa(pdf_bytes, level="2b"):
+def convert_to_pdfa(pdf_bytes, level="4f"):
     gs_cmd = "gswin64c" if os.name == "nt" else "gs"
-    part = "3" if level == "3b" else "2"
-    conformance = "B"
+    
+    # Configuraciones específicas para PDF/A-4 y PDF/A-4f
+    if level == "4f":
+        part_xml = "4"
+        conformance_xml = "F"
+    else: # PDF/A-4 Base
+        part_xml = "4"
+        conformance_xml = ""
+        
+    # Ghostscript usa internamente el motor PDFA=3 como puente para incrustar, 
+    # pero el XML final dictará el estándar 4 al visor (Acrobat).
+    gs_part = "3" 
     
     attachments = []
     try:
@@ -67,7 +77,7 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
     try:
         cmd = [
             gs_cmd,
-            "-dPDFA=" + part,
+            f"-dPDFA={gs_part}",
             "-dBATCH",
             "-dNOPAUSE",
             "-dColorConversionStrategy=/UseDeviceIndependentColor",
@@ -83,16 +93,20 @@ def convert_to_pdfa(pdf_bytes, level="2b"):
             return None
             
         doc = pymupdf.open(temp_out_path)
-        if level == "3b" and attachments:
+        
+        # Re-inyectar adjuntos si es PDF/A-4f
+        if level == "4f" and attachments:
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name)
         
+        # Estructura XML XMP para PDF/A-4
+        conformance_tag = f"<pdfaid:conformance>{conformance_xml}</pdfaid:conformance>" if conformance_xml else ""
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
-      <pdfaid:part>{part}</pdfaid:part>
-      <pdfaid:conformance>{conformance}</pdfaid:conformance>
+      <pdfaid:part>{part_xml}</pdfaid:part>
+      {conformance_tag}
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -117,10 +131,21 @@ def validate_pdfa(pdf_bytes):
     xml = doc.get_xml_metadata()
     if not xml:
         return False, "No es PDF/A (Sin metadatos XML)"
+    
+    # Tolerancia para encontrar versiones 4, 4f, o las antiguas 2b, 3b
     part_match = re.search(r'<pdfaid:part>(\d)</pdfaid:part>', xml)
-    conf_match = re.search(r'<pdfaid:conformance>([A-Z]+)</pdfaid:conformance>', xml)
-    if part_match and conf_match:
-        return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)}"
+    conf_match = re.search(r'<pdfaid:conformance>([a-zA-Z]*)</pdfaid:conformance>', xml)
+    
+    if part_match:
+        part = part_match.group(1)
+        conf = conf_match.group(1).upper() if conf_match and conf_match.group(1) else ""
+        
+        if part == "4":
+            nivel = f"PDF/A-4{conf.lower()}" if conf else "PDF/A-4 (Base)"
+            return True, nivel
+        elif conf:
+            return True, f"PDF/A-{part}{conf.lower()}"
+            
     return False, "No detectado"
 
 def get_attachments_info(pdf_bytes):
@@ -159,7 +184,6 @@ def generate_report(file_name, file_bytes):
     }
 
 def generate_electronic_index(archivos, origen_default="Digitalizado"):
-    """Procesa un lote multiformato, ordena cronológicamente y genera el DataFrame."""
     temp_docs = []
     
     for file_obj in archivos:
@@ -253,7 +277,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v7.1", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v8.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -274,8 +298,8 @@ with col_menu:
             (
                 "1. Anexar Excel a PDF",
                 "2. Adjuntar Cualquier Archivo",
-                "3. Convertir a PDF/A-2b",
-                "4. Convertir a PDF/A-3b",
+                "3. Convertir a PDF/A-4 (Base)",
+                "4. Convertir a PDF/A-4f (Multiformato)",
                 "5. Generar Informe de Preservación"
             )
         )
@@ -290,7 +314,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v7.1)")
+    st.title("📄 Herramienta de Preservación Documental (v8.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -311,9 +335,9 @@ with col_main:
 
             elif "Convertir a PDF/A" in menu_option:
                 st.subheader(menu_option)
-                level = "3b" if "3b" in menu_option else "2b"
-                if st.button(f"Ejecutar Conversión a {level}"):
-                    with st.spinner("Procesando conversión..."):
+                level = "4f" if "4f" in menu_option else "4"
+                if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
+                    with st.spinner("Procesando recodificación a la norma 2020..."):
                         result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
                         if result_pdfa:
                             st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
@@ -347,7 +371,6 @@ with col_main:
                         with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                             df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                         
-                        # CORRECCIÓN AQUÍ: parser="etree"
                         xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
                         
                         st.success("¡Índices electrónicos generados con éxito!")
@@ -411,7 +434,6 @@ with col_main:
                                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
                                     df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
                                 
-                                # CORRECCIÓN AQUÍ: parser="etree"
                                 xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
                                 
                                 st.success("¡Índices electrónicos generados con éxito desde Aurora Nextcloud!")
