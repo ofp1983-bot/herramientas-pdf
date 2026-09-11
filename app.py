@@ -61,7 +61,8 @@ def fix_pdfa_attachment_dictionaries(doc):
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, uf=attachment_name)
+    # CORRECCIÓN AQUÍ: ufilename=attachment_name
+    doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
     return doc.write()
 
 def convert_to_pdfa(pdf_bytes, level="3b"):
@@ -115,8 +116,8 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         
         if level == "3b" and attachments:
             for name, file_data in attachments:
-                # El parámetro uf=name corrige el error F y UF de veraPDF
-                doc.embfile_add(name, file_data, filename=name, uf=name)
+                # CORRECCIÓN AQUÍ: ufilename=name soluciona el error F y UF de veraPDF
+                doc.embfile_add(name, file_data, filename=name, ufilename=name)
             
             # Ejecutar inyección de diccionarios
             fix_pdfa_attachment_dictionaries(doc)
@@ -284,7 +285,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v11.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v11.1", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -321,7 +322,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v11.0)")
+    st.title("📄 Herramienta de Preservación Documental (v11.1)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
