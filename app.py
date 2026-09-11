@@ -31,23 +31,26 @@ def fix_pdfa_attachment_dictionaries(doc):
     
     for xref in range(1, doc.xref_length()):
         try:
-            # Obtener el tipo de forma segura (evita colapsos de memoria)
-            type_val = doc.xref_get_key(xref, "Type")
-            if type_val[0] == "name":
-                # Inyección para el FileSpec (El contenedor)
-                if type_val[1] == "/Filespec":
-                    doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
-                    af_xrefs.append(xref)
+            keys = doc.xref_get_keys(xref)
+            
+            # 1. Inyección para el FileSpec (Contenedor del anexo)
+            # Detección infalible: Si tiene las claves de anexo EF y nombre UF
+            if "EF" in keys and "UF" in keys:
+                doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
+                doc.xref_set_key(xref, "Type", "/Filespec") # Forzamos la etiqueta estructural
+                af_xrefs.append(xref)
                 
-                # Inyección para el EmbeddedFile (Los datos puros MIME)
-                elif type_val[1] == "/EmbeddedFile":
+            # 2. Inyección para el EmbeddedFile (Los datos puros MIME)
+            elif "Type" in keys:
+                type_val = doc.xref_get_key(xref, "Type")
+                if type_val[0] == "name" and type_val[1] == "/EmbeddedFile":
                     subtype_val = doc.xref_get_key(xref, "Subtype")
                     if subtype_val[0] == "null" or subtype_val[1] == "":
                         doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
         except Exception:
             continue
             
-    # Registrar oficialmente en el Catálogo como Archivos Asociados (/AF)
+    # 3. Registrar oficialmente en el Catálogo como Archivos Asociados (/AF)
     if af_xrefs:
         af_str = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
         try:
@@ -61,7 +64,6 @@ def fix_pdfa_attachment_dictionaries(doc):
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    # CORRECCIÓN AQUÍ: ufilename=attachment_name
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
     return doc.write()
 
@@ -80,7 +82,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         for name in doc_original.embfile_names():
             doc_original.embfile_del(name)
             
-        # Sobrescribir los bytes con un PDF completamente limpio
         pdf_bytes = doc_original.write()
         doc_original.close()
     except Exception:
@@ -116,7 +117,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         
         if level == "3b" and attachments:
             for name, file_data in attachments:
-                # CORRECCIÓN AQUÍ: ufilename=name soluciona el error F y UF de veraPDF
                 doc.embfile_add(name, file_data, filename=name, ufilename=name)
             
             # Ejecutar inyección de diccionarios
@@ -285,7 +285,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v11.1", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v11.2", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -322,7 +322,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v11.1)")
+    st.title("📄 Herramienta de Preservación Documental (v11.2)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
