@@ -285,7 +285,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v15.1", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v16.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -323,7 +323,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v15.1)")
+    st.title("📄 Herramienta de Preservación Documental (v16.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -362,12 +362,13 @@ with col_main:
                         st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
 
             elif "6. Extraer Metadatos" in menu_option:
-                st.subheader("🗂️ Extracción Forense de Metadatos")
-                if st.button("Extraer y Analizar Documento"):
-                    with st.spinner("Ejecutando escáner profundo..."):
+                st.subheader("🗂️ Extracción Forense Absoluta de Metadatos")
+                if st.button("Ejecutar Escáner Profundo"):
+                    with st.spinner("Analizando diccionarios y estructura interna..."):
                         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                        pdf_pike = pikepdf.Pdf.open(BytesIO(pdf_bytes))
                         
-                        st.markdown("### 📄 1. Propiedades Físicas y Estructura")
+                        st.markdown("### 📄 1. Propiedades Físicas y de Seguridad")
                         col1, col2 = st.columns(2)
                         with col1:
                             st.write(f"**Total de Páginas:** {doc.page_count}")
@@ -377,24 +378,34 @@ with col_main:
                             st.write(f"**Anexos detectados:** {doc.embfile_count()}")
 
                         st.markdown("---")
-                        st.markdown("### 🏷️ 2. Diccionario Interno Crudo (`/Info`)")
-                        st.write("Muestra todos los campos estándar y personalizados incrustados en el contenedor PDF.")
-                        try:
-                            pdf_pike = pikepdf.Pdf.open(BytesIO(pdf_bytes))
-                            info_dict = {}
-                            if "/Info" in pdf_pike.trailer:
-                                for key, value in pdf_pike.docinfo.items():
-                                    info_dict[str(key)] = str(value)
-                            
-                            if info_dict:
-                                st.json(info_dict)
-                            else:
-                                st.info("El diccionario /Info está vacío o no existe.")
-                        except Exception as e:
-                            st.error(f"Error extrayendo diccionario: {e}")
+                        st.markdown("### 🏷️ 2. Diccionario de Información (`/Info`)")
+                        st.write("Metadatos tradicionales y campos ocultos inyectados por el software creador.")
+                        info_dict = {}
+                        if hasattr(pdf_pike, 'docinfo'):
+                            for key, value in pdf_pike.docinfo.items():
+                                info_dict[str(key)] = str(value)
+                        
+                        if info_dict:
+                            st.json(info_dict)
+                        else:
+                            st.info("El diccionario /Info está vacío o no existe en este documento.")
 
                         st.markdown("---")
-                        st.markdown("### 📎 3. Metadatos de Archivos Asociados (Anexos)")
+                        st.markdown("### 🏗️ 3. Estructura del Catálogo Maestro (`/Root`)")
+                        st.write("El 'cerebro' del documento. Revela formularios (`/AcroForm`), esquemas de color (`/OutputIntents`) y firmas digitales.")
+                        root_dict = {}
+                        for key, value in pdf_pike.Root.items():
+                            if str(key) == "/Pages":
+                                root_dict[str(key)] = f"[Árbol de Páginas Oculto para evitar saturación: {len(pdf_pike.pages)} páginas]"
+                            else:
+                                val_str = str(value)
+                                if len(val_str) > 200:
+                                    val_str = val_str[:200] + "... [Contenido truncado]"
+                                root_dict[str(key)] = val_str
+                        st.json(root_dict)
+
+                        st.markdown("---")
+                        st.markdown("### 📎 4. Metadatos de Archivos Asociados (Anexos)")
                         if doc.embfile_count() > 0:
                             for anexo in doc.embfile_names():
                                 info = doc.embfile_info(anexo)
@@ -407,8 +418,8 @@ with col_main:
                             st.info("No hay archivos incrustados en este documento.")
 
                         st.markdown("---")
-                        st.markdown("### 🧩 4. Capa XMP Completa (XML Crudo)")
-                        st.write("Estructura profunda donde residen las firmas PDF/A y los esquemas de metadatos extensibles.")
+                        st.markdown("### 🧩 5. Capa XMP Completa (XML Crudo)")
+                        st.write("Aquí residen las firmas PDF/A y los esquemas de preservación extensibles.")
                         xmp_meta = doc.get_xml_metadata()
                         if xmp_meta:
                             with st.expander("Ver estructura XML completa", expanded=True):
@@ -417,6 +428,7 @@ with col_main:
                             st.warning("Este documento no contiene capa XMP incrustada.")
                             
                         doc.close()
+                        pdf_pike.close()
 
     else:
         st.subheader("📁 Índice Electrónico de Expedientes Multiformato")
