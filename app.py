@@ -10,7 +10,6 @@ import subprocess
 import tempfile
 from datetime import datetime
 import re
-import xml.etree.ElementTree as ET
 
 # ==========================================
 # FUNCIONES AUXILIARES
@@ -39,6 +38,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
+    # 1. Rescatar y ELIMINAR anexos para procesar un PDF limpio en Ghostscript
     attachments = []
     try:
         doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -53,6 +53,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     except Exception:
         pass
     
+    # 2. Conversión Ghostscript (Construye el lienzo base normado)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -77,6 +78,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
+        # 3. CONSTRUCCIÓN ESTRUCTURAL BLINDADA CON PIKEPDF
         pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
         
         if level == "3b" and attachments:
@@ -90,10 +92,12 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                 pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
                 
             for name, file_data in attachments:
+                # Inyección 6.8-1: Stream de datos y MIME (Texto plano, pikepdf lo escapa solo)
                 ef_stream = pdf.make_stream(file_data)
                 ef_stream.Type = pikepdf.Name("/EmbeddedFile")
                 ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
                 
+                # Inyección 6.8-3 y 6.8-4: Crear diccionario indirecto
                 filespec_dict = pikepdf.Dictionary(
                     Type=pikepdf.Name("/Filespec"),
                     F=name,
@@ -102,12 +106,15 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                     AFRelationship=pikepdf.Name("/Unspecified")
                 )
                 
+                # LA CLAVE DE ORO: make_indirect convierte el diccionario en un puntero (ej. 12 0 R)
                 filespec_obj = pdf.make_indirect(filespec_dict)
                 
+                # Matriculamos el MISMO puntero en ambos lados
                 pdf.Root.Names.EmbeddedFiles.Names.append(name)
                 pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
                 pdf.Root.AF.append(filespec_obj)
                 
+        # 4. Inyección XML XMP puramente nativa con pikepdf
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -143,48 +150,6 @@ def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 def validate_pdfa(pdf_bytes):
-    """
-    Motor de validación híbrido: 
-    Intenta ejecutar veraPDF en el sistema para una validación estricta forense.
-    Si falla (no instalado o error), usa la revisión superficial de metadatos con PyMuPDF.
-    """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
-        temp_pdf.write(pdf_bytes)
-        temp_pdf_path = temp_pdf.name
-        
-    # Fase 1: Validación estricta con veraPDF
-    try:
-        # shell=True permite encontrar el ejecutable global 'verapdf' en Windows/Linux
-        process = subprocess.run(
-            f'verapdf "{temp_pdf_path}"', 
-            shell=True, 
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE, 
-            text=True, 
-            encoding='utf-8', 
-            errors='ignore'
-        )
-        
-        if process.stdout and "<?xml" in process.stdout:
-            # Extraer solo la parte XML de la salida de consola
-            xml_str = process.stdout[process.stdout.find("<?xml"):]
-            root = ET.fromstring(xml_str)
-            
-            report_node = root.find('.//validationReport')
-            if report_node is not None:
-                is_compliant = report_node.get('isCompliant') == 'true'
-                profile_name = report_node.get('profileName', 'Desconocido')
-                profile_clean = profile_name.replace(" validation profile", "")
-                
-                estado = f"{profile_clean} (Auditoría: veraPDF)"
-                return is_compliant, estado
-    except Exception:
-        pass # Falla silenciosa si veraPDF no está configurado, pasa a Fase 2
-    finally:
-        if os.path.exists(temp_pdf_path): 
-            os.remove(temp_pdf_path)
-
-    # Fase 2: Validación superficial de metadatos (Respaldo)
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         xml = doc.get_xml_metadata()
@@ -194,7 +159,7 @@ def validate_pdfa(pdf_bytes):
         part_match = re.search(r'<pdfaid:part>(\d)</pdfaid:part>', xml)
         conf_match = re.search(r'<pdfaid:conformance>([A-Z]+)</pdfaid:conformance>', xml)
         if part_match and conf_match:
-            return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)} (Lectura de Etiqueta)"
+            return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)}"
         return False, "No detectado"
     except:
         return False, "Error al leer documento"
@@ -220,8 +185,8 @@ def generate_report(file_name, file_bytes):
         "Hash SHA-256": sha256_hash,
         "Tamaño": f"{size_kb:.2f} KB",
         "Fecha de Análisis": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Cumplimiento PDF/A": "Válido (Normado)" if is_valid else "No Cumple (Inválido)",
-        "Nivel y Motor de Verificación": pdfa_level,
+        "Cumplimiento PDF/A": "Válido" if is_valid else "No Cumple",
+        "Nivel PDF/A Detectado": pdfa_level,
         "Contiene Anexos": "Sí" if nombres_anexos else "No",
         "Nombre de los Anexos": ", ".join(nombres_anexos) if nombres_anexos else "N/A"
     }
@@ -246,8 +211,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         
         if extension == ".pdf":
             is_valid, pdfa_level = validate_pdfa(file_bytes)
-            # Acortamos el texto para que quepa bien en el Excel del índice
-            pdfa_final = pdfa_level.split(" ")[0] if is_valid else "No detectado"
+            pdfa_final = pdfa_level if is_valid else "No detectado"
             
             nombres_anexos = get_attachments_info(file_bytes)
             tiene_anexos = "Sí" if nombres_anexos else "No"
@@ -321,7 +285,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v16.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v15.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -358,7 +322,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v16.0)")
+    st.title("📄 Herramienta de Preservación Documental (v15.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -381,15 +345,15 @@ with col_main:
                 st.subheader(menu_option)
                 level = "3b" if "3b" in menu_option else "2b"
                 if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
-                    with st.spinner("Construyendo matriz estructural y codificando a norma..."):
+                    with st.spinner("Construyendo matriz estructural de objetos indirectos..."):
                         result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
                         if result_pdfa:
                             st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
 
             elif "5. Generar Informe" in menu_option:
-                st.subheader("📊 Informe de Preservación (Estricto)")
-                if st.button("Ejecutar Auditoría Forense"):
-                    with st.spinner("Sometiendo documento al motor veraPDF..."):
+                st.subheader("📊 Informe de Preservación")
+                if st.button("Ejecutar Análisis"):
+                    with st.spinner("Analizando..."):
                         report = generate_report(main_pdf.name, pdf_bytes)
                         for k, v in report.items():
                             st.markdown(f"**{k}:** {v}")
@@ -407,7 +371,7 @@ with col_main:
             if batch_files:
                 st.info(f"Se han cargado {len(batch_files)} archivos para procesar.")
                 if st.button("Generar Índice"):
-                    with st.spinner("Auditando lote con veraPDF y extrayendo metadatos..."):
+                    with st.spinner("Procesando lote, ordenando por fecha y extrayendo metadatos..."):
                         df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
                         st.dataframe(df_index)
                         
