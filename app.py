@@ -285,7 +285,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v15.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v15.1", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -323,7 +323,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v15.0)")
+    st.title("📄 Herramienta de Preservación Documental (v15.1)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -362,27 +362,59 @@ with col_main:
                         st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
 
             elif "6. Extraer Metadatos" in menu_option:
-                st.subheader("🗂️ Extracción Completa de Metadatos")
-                if st.button("Extraer y Analizar"):
-                    with st.spinner("Leyendo diccionarios y estructura XML..."):
+                st.subheader("🗂️ Extracción Forense de Metadatos")
+                if st.button("Extraer y Analizar Documento"):
+                    with st.spinner("Ejecutando escáner profundo..."):
                         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
                         
-                        # 1. Metadatos Estándar (Diccionario interno)
-                        st.markdown("### Metadatos Estándar (Diccionario PDF)")
-                        std_meta = doc.metadata
-                        if std_meta:
-                            meta_df = pd.DataFrame([{"Propiedad": k, "Valor": v} for k, v in std_meta.items() if v])
-                            st.table(meta_df)
-                        else:
-                            st.info("El documento no tiene metadatos estándar legibles.")
+                        st.markdown("### 📄 1. Propiedades Físicas y Estructura")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.write(f"**Total de Páginas:** {doc.page_count}")
+                            st.write(f"**Versión PDF:** {doc.metadata.get('format', 'Desconocido')}")
+                        with col2:
+                            st.write(f"**Cifrado:** {'Sí (Protegido)' if doc.is_encrypted else 'No'}")
+                            st.write(f"**Anexos detectados:** {doc.embfile_count()}")
+
+                        st.markdown("---")
+                        st.markdown("### 🏷️ 2. Diccionario Interno Crudo (`/Info`)")
+                        st.write("Muestra todos los campos estándar y personalizados incrustados en el contenedor PDF.")
+                        try:
+                            pdf_pike = pikepdf.Pdf.open(BytesIO(pdf_bytes))
+                            info_dict = {}
+                            if "/Info" in pdf_pike.trailer:
+                                for key, value in pdf_pike.docinfo.items():
+                                    info_dict[str(key)] = str(value)
                             
-                        # 2. Metadatos XMP (Estructura XML)
-                        st.markdown("### Metadatos XMP (Estructura XML)")
+                            if info_dict:
+                                st.json(info_dict)
+                            else:
+                                st.info("El diccionario /Info está vacío o no existe.")
+                        except Exception as e:
+                            st.error(f"Error extrayendo diccionario: {e}")
+
+                        st.markdown("---")
+                        st.markdown("### 📎 3. Metadatos de Archivos Asociados (Anexos)")
+                        if doc.embfile_count() > 0:
+                            for anexo in doc.embfile_names():
+                                info = doc.embfile_info(anexo)
+                                size_kb = info.get('size', 0) / 1024
+                                st.write(f"**Archivo:** `{anexo}`")
+                                st.write(f"- **Tamaño:** {size_kb:.2f} KB")
+                                st.write(f"- **Descripción:** {info.get('desc', 'N/A')}")
+                                st.write(f"- **Fecha Modificación:** {info.get('modDate', 'N/A')}")
+                        else:
+                            st.info("No hay archivos incrustados en este documento.")
+
+                        st.markdown("---")
+                        st.markdown("### 🧩 4. Capa XMP Completa (XML Crudo)")
+                        st.write("Estructura profunda donde residen las firmas PDF/A y los esquemas de metadatos extensibles.")
                         xmp_meta = doc.get_xml_metadata()
                         if xmp_meta:
-                            st.code(xmp_meta, language="xml")
+                            with st.expander("Ver estructura XML completa", expanded=True):
+                                st.code(xmp_meta, language="xml")
                         else:
-                            st.info("Este documento no contiene metadatos XMP incrustados (Ausencia de firma PDF/A).")
+                            st.warning("Este documento no contiene capa XMP incrustada.")
                             
                         doc.close()
 
