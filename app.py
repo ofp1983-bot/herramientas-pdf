@@ -1,6 +1,6 @@
 import streamlit as st
-import pymupdf  # Para lectura y metadatos XMP
-import pikepdf  # EL NUEVO MOTOR PARA CUMPLIMIENTO PDF/A-3
+import pymupdf  # Para lectura y extracción
+import pikepdf  # Motor estructural puro para cumplimiento PDF/A-3
 import pandas as pd
 from nc_py_api import Nextcloud
 from io import BytesIO
@@ -29,7 +29,6 @@ def parse_pdf_date(date_str):
 # ==========================================
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
-    # Usamos pymupdf para incrustaciones sencillas (fuera de PDF/A)
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
     return doc.write()
@@ -80,10 +79,9 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             return None
             
         # 3. CONSTRUCCIÓN ESTRUCTURAL BLINDADA CON PIKEPDF
+        pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
+        
         if level == "3b" and attachments:
-            pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
-            
-            # Garantizamos la existencia de los diccionarios principales
             if "/AF" not in pdf.Root:
                 pdf.Root.AF = pikepdf.Array()
                 
@@ -94,13 +92,13 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                 pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
                 
             for name, file_data in attachments:
-                # Inyección 6.8-1: Stream de datos y MIME
+                # Inyección 6.8-1: Stream de datos y MIME (Texto plano, pikepdf lo escapa solo)
                 ef_stream = pdf.make_stream(file_data)
                 ef_stream.Type = pikepdf.Name("/EmbeddedFile")
-                ef_stream.Subtype = pikepdf.Name("/application#2Foctet-stream")
+                ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
                 
-                # Inyección 6.8-3: Creación del Contenedor con AFRelationship y Etiquetas F/UF
-                filespec = pikepdf.Dictionary(
+                # Inyección 6.8-3 y 6.8-4: Crear diccionario indirecto
+                filespec_dict = pikepdf.Dictionary(
                     Type=pikepdf.Name("/Filespec"),
                     F=name,
                     UF=name,
@@ -108,18 +106,15 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                     AFRelationship=pikepdf.Name("/Unspecified")
                 )
                 
-                # Guardamos el anexo en el árbol de nombres interno
+                # LA CLAVE DE ORO: make_indirect convierte el diccionario en un puntero (ej. 12 0 R)
+                filespec_obj = pdf.make_indirect(filespec_dict)
+                
+                # Matriculamos el MISMO puntero en ambos lados
                 pdf.Root.Names.EmbeddedFiles.Names.append(name)
-                pdf.Root.Names.EmbeddedFiles.Names.append(filespec)
+                pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
+                pdf.Root.AF.append(filespec_obj)
                 
-                # Inyección 6.8-4: Matriculamos en el Catálogo principal como Archivo Asociado
-                pdf.Root.AF.append(filespec)
-                
-            pdf.save(temp_out_path)
-            pdf.close()
-            
-        # 4. Inyección Final de Metadatos XML XMP (De vuelta a PyMuPDF)
-        doc = pymupdf.open(temp_out_path)
+        # 4. Inyección XML XMP puramente nativa con pikepdf
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -131,9 +126,17 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
 </x:xmpmeta>
 <?xpacket end="w"?>"""
         
-        doc.set_xml_metadata(xml_metadata)
-        pdfa_bytes = doc.write(deflate=True)
-        doc.close()
+        meta_stream = pdf.make_stream(xml_metadata.encode('utf-8'))
+        meta_stream.Type = pikepdf.Name("/Metadata")
+        meta_stream.Subtype = pikepdf.Name("/XML")
+        pdf.Root.Metadata = meta_stream
+        
+        pdf.save(temp_out_path)
+        pdf.close()
+        
+        with open(temp_out_path, "rb") as f:
+            pdfa_bytes = f.read()
+            
         return pdfa_bytes
         
     except Exception as e:
@@ -282,7 +285,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v14.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v15.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -319,7 +322,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v14.0)")
+    st.title("📄 Herramienta de Preservación Documental (v15.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -342,7 +345,7 @@ with col_main:
                 st.subheader(menu_option)
                 level = "3b" if "3b" in menu_option else "2b"
                 if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
-                    with st.spinner("Construyendo matriz estructural y codificando a norma..."):
+                    with st.spinner("Construyendo matriz estructural de objetos indirectos..."):
                         result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
                         if result_pdfa:
                             st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
