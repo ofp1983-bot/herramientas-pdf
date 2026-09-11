@@ -25,45 +25,59 @@ def parse_pdf_date(date_str):
     return str(date_str) 
 
 def fix_pdfa_attachment_dictionaries(doc):
-    """Escanea el ADN absoluto del PDF para inyectar las reglas 6.8 de veraPDF sin fallos de jerarquía"""
+    """Navega el árbol oficial del PDF para inyectar las reglas 6.8 de veraPDF de forma quirúrgica"""
     catalog_xref = doc.pdf_catalog()
     af_xrefs = []
     
-    # Barrido objeto por objeto para interceptar los diccionarios huérfanos
-    for xref in range(1, doc.xref_length()):
-        try:
-            keys = doc.xref_get_keys(xref)
+    # 1. Navegación directa al diccionario de Nombres
+    names_val = doc.xref_get_key(catalog_xref, "Names")
+    if names_val[0] != "xref": return
+    names_xref = int(names_val[1].split()[0])
+    
+    # 2. Navegación directa al árbol de Archivos Incrustados
+    ef_val = doc.xref_get_key(names_xref, "EmbeddedFiles")
+    if ef_val[0] != "xref": return
+    ef_xref = int(ef_val[1].split()[0])
+    
+    # 3. Extracción de las referencias de los anexos
+    arr_val = doc.xref_get_key(ef_xref, "Names")
+    refs = []
+    if arr_val[0] == "array":
+        refs = re.findall(r'(\d+)\s+0\s+R', arr_val[1])
+    elif arr_val[0] == "xref":
+        arr_xref = int(arr_val[1].split()[0])
+        obj_str = doc.xref_object(arr_xref)
+        refs = re.findall(r'(\d+)\s+0\s+R', obj_str)
+        
+    # 4. Inyección de metadatos en cada anexo encontrado
+    for fs in refs:
+        fs_xref = int(fs)
+        af_xrefs.append(fs_xref)
+        
+        # Regla 6.8-3: Relación explícita
+        doc.xref_set_key(fs_xref, "AFRelationship", "/Unspecified")
+        doc.xref_set_key(fs_xref, "Type", "/Filespec")
+        
+        # Regla 6.8-1: MIME Type puro en el stream de datos
+        ef_dict = doc.xref_get_key(fs_xref, "EF")
+        stream_refs = []
+        if ef_dict[0] == "dict":
+            stream_refs = re.findall(r'(\d+)\s+0\s+R', ef_dict[1])
+        elif ef_dict[0] == "xref":
+            ef_dict_xref = int(ef_dict[1].split()[0])
+            obj_str = doc.xref_object(ef_dict_xref)
+            stream_refs = re.findall(r'(\d+)\s+0\s+R', obj_str)
             
-            # Identificador inconfundible de un FileSpec (Contenedor de Anexos)
-            is_filespec = False
-            type_val = doc.xref_get_key(xref, "Type")
-            if type_val[0] == "name" and type_val[1] == "/Filespec":
-                is_filespec = True
-            elif "EF" in keys and ("UF" in keys or "F" in keys):
-                is_filespec = True
-                
-            if is_filespec:
-                # Inyección Regla 6.8-3: Relación explícita
-                doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
-                doc.xref_set_key(xref, "Type", "/Filespec") 
-                af_xrefs.append(xref)
-                
-                # Inyección Regla 6.8-1: MIME Type puro en el stream de datos
-                ef_val = doc.xref_get_key(xref, "EF")
-                if ef_val[1] != "null":
-                    streams = re.findall(r'(\d+)\s+0\s+R', ef_val[1])
-                    for s in streams:
-                        s_xref = int(s)
-                        doc.xref_set_key(s_xref, "Type", "/EmbeddedFile")
-                        doc.xref_set_key(s_xref, "Subtype", "/application#2Foctet-stream")
-        except Exception:
-            continue
+        for s in stream_refs:
+            s_xref = int(s)
+            doc.xref_set_key(s_xref, "Type", "/EmbeddedFile")
+            doc.xref_set_key(s_xref, "Subtype", "/application#2Foctet-stream")
             
-    # Inyección Regla 6.8-4: Matricular Archivos Asociados en el Catálogo
+    # 5. Regla 6.8-4: Matricular en el Catálogo Maestro como Archivo Asociado
     if af_xrefs:
-        af_array = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
+        af_str = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
         try:
-            doc.xref_set_key(catalog_xref, "AF", af_array)
+            doc.xref_set_key(catalog_xref, "AF", af_str)
         except Exception:
             pass
 
@@ -81,7 +95,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # 1. Rescatar y purgar anexos del archivo original para evitar duplicidad
+    # 1. Rescatar y purgar anexos del archivo original (Previene duplicidad y limpia memoria)
     attachments = []
     try:
         doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -91,7 +105,8 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         for name in doc_original.embfile_names():
             doc_original.embfile_del(name)
             
-        pdf_bytes = doc_original.write()
+        # El garbage=4 destruye los diccionarios huérfanos antes de enviarlos a Ghostscript
+        pdf_bytes = doc_original.write(garbage=4)
         doc_original.close()
     except Exception:
         pass
@@ -121,17 +136,15 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        # 3. Inserción de Anexos
+        # 3. Inserción de Anexos Estructurales
         doc = pymupdf.open(temp_out_path)
         
         if level == "3b" and attachments:
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name, ufilename=name)
             
-            # Puente de memoria: Guardar y reabrir para forzar construcción de índices de xref
-            temp_pdf_bytes = doc.write()
-            doc.close()
-            doc = pymupdf.open(stream=temp_pdf_bytes, filetype="pdf")
+            # Ejecutamos la inyección quirúrgica directamente en la memoria
+            fix_pdfa_attachment_dictionaries(doc)
             
         # 4. Inyección Final de Metadatos XMP
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
@@ -147,11 +160,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         
         doc.set_xml_metadata(xml_metadata)
         
-        # 5. Inyección estructural de validadores justo antes de la escritura final
-        if level == "3b" and attachments:
-            fix_pdfa_attachment_dictionaries(doc)
-            
-        pdfa_bytes = doc.write()
+        pdfa_bytes = doc.write(deflate=True)
         doc.close()
         return pdfa_bytes
         
