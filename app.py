@@ -1,7 +1,6 @@
 import streamlit as st
 import pymupdf  # Reemplazo oficial de fitz
 import pypdf
-from pypdf.generic import NameObject, ArrayObject
 import pandas as pd
 from nc_py_api import Nextcloud
 from io import BytesIO
@@ -26,6 +25,36 @@ def parse_pdf_date(date_str):
         return f"{y}-{m}-{d} {h}:{mn}:{s}"
     return str(date_str) 
 
+def fix_pdfa_attachment_dictionaries(doc):
+    """Inyecta etiquetas estructurales blindadas para cumplir con las reglas de PDF/A-3b"""
+    catalog_xref = doc.pdf_catalog()
+    af_xrefs = []
+    
+    for xref in range(1, doc.xref_length()):
+        try:
+            keys = doc.xref_get_keys(xref)
+            
+            # 1. Detectar diccionarios FileSpec (el contenedor del anexo)
+            if "EF" in keys and ("F" in keys or "UF" in keys):
+                doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
+                doc.xref_set_key(xref, "Type", "/Filespec")
+                af_xrefs.append(xref)
+            
+            # 2. Detectar streams de datos puros para forzar el MIME Type
+            if "Type" in keys:
+                type_val = doc.xref_get_key(xref, "Type")
+                if type_val and len(type_val) == 2 and type_val[1] == "/EmbeddedFile":
+                    if "Subtype" not in keys:
+                        doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
+        except Exception:
+            continue
+            
+    # 3. Registrar oficialmente en el Catálogo como Archivos Asociados (/AF)
+    if af_xrefs:
+        af_xrefs = list(set(af_xrefs))
+        af_array = "[ " + " ".join([f"{x} 0 R" for x in af_xrefs]) + " ]"
+        doc.xref_set_key(catalog_xref, "AF", af_array)
+
 # ==========================================
 # FUNCIONES PRINCIPALES
 # ==========================================
@@ -40,7 +69,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # 1. Rescatar anexos originales
     attachments = []
     try:
         reader = pypdf.PdfReader(BytesIO(pdf_bytes))
@@ -60,7 +88,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         except Exception:
             pass
     
-    # 2. Conversión Ghostscript (Construye el esqueleto base)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -85,62 +112,20 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        with open(temp_out_path, "rb") as f:
-            gs_pdf_bytes = f.read()
-            
-        # 3. Ensamblaje estructural nativo para PDF/A-3b usando pypdf (clone_from)
+        doc = pymupdf.open(temp_out_path)
+        
         if level == "3b" and attachments:
-            reader_gs = pypdf.PdfReader(BytesIO(gs_pdf_bytes))
+            for name, file_data in attachments:
+                doc.embfile_add(name, file_data, filename=name)
             
-            # Clonar mantiene la estructura original de Ghostscript intacta
-            writer = pypdf.PdfWriter(clone_from=reader_gs)
+            # EL TRUCO: Guardar en memoria para que se construyan los punteros internos
+            temp_pdf_bytes = doc.write()
+            doc.close()
             
-            # Incrustar archivos
-            for name, data in attachments:
-                writer.add_attachment(name, data)
-                
-            # Validar e inyectar estructura PDF/A-3b exacta para VeraPDF
-            root = writer.root_object
-            af_array = ArrayObject()
-            
-            names = root.get("/Names")
-            if names:
-                ef = names.get_object().get("/EmbeddedFiles")
-                if ef:
-                    ef_names = ef.get_object().get("/Names")
-                    if ef_names:
-                        # Iterar sobre el diccionario de nombres del anexo
-                        for i in range(1, len(ef_names), 2):
-                            file_spec_ref = ef_names[i]
-                            file_spec = file_spec_ref.get_object()
-                            
-                            # Inyección Regla 6.8-3: Relación del archivo
-                            file_spec[NameObject("/AFRelationship")] = NameObject("/Unspecified")
-                            file_spec[NameObject("/Type")] = NameObject("/Filespec")
-                            
-                            # Inyección Regla 6.8-4: Matricular en array /AF
-                            af_array.append(file_spec_ref)
-                            
-                            # Inyección Reglas 6.9: Subtype MIME
-                            ef_dict = file_spec.get("/EF")
-                            if ef_dict:
-                                ef_streams = ef_dict.get_object()
-                                for k, stream_ref in ef_streams.items():
-                                    stream = stream_ref.get_object()
-                                    stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
-                                    stream[NameObject("/Subtype")] = NameObject("/application#2Foctet-stream")
-                                    
-            if af_array:
-                root[NameObject("/AF")] = af_array
-                
-            out_buffer = BytesIO()
-            writer.write(out_buffer)
-            final_pdf_bytes = out_buffer.getvalue()
-        else:
-            final_pdf_bytes = gs_pdf_bytes
-            
-        # 4. Inyección Final XMP asegurada
-        doc = pymupdf.open(stream=final_pdf_bytes, filetype="pdf")
+            # Reabrir el documento ya estructurado para aplicar correcciones normativas
+            doc = pymupdf.open(stream=temp_pdf_bytes, filetype="pdf")
+            fix_pdfa_attachment_dictionaries(doc)
+        
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -307,7 +292,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v10.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v9.1", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -344,7 +329,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v10.0)")
+    st.title("📄 Herramienta de Preservación Documental (v9.1)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
