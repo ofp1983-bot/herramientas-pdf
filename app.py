@@ -25,32 +25,58 @@ def parse_pdf_date(date_str):
     return str(date_str) 
 
 def fix_pdfa_attachment_dictionaries(doc):
-    """Inyecta de forma segura etiquetas estructurales blindadas para cumplir con veraPDF"""
+    """Navega el árbol de nombres del PDF para inyectar las reglas 6.8-3 y 6.8-4 de veraPDF de forma precisa"""
     catalog_xref = doc.pdf_catalog()
     af_xrefs = []
     
+    # 1. Navegación directa por la jerarquía exacta que escanea veraPDF: Catalog -> Names -> EmbeddedFiles
+    try:
+        names_val = doc.xref_get_key(catalog_xref, "Names")
+        if names_val[0] == "xref":
+            names_xref = int(names_val[1].split()[0])
+            
+            ef_val = doc.xref_get_key(names_xref, "EmbeddedFiles")
+            if ef_val[0] == "xref":
+                ef_xref = int(ef_val[1].split()[0])
+                
+                # Accedemos a la matriz de nombres de los archivos adjuntos
+                names_array = doc.xref_get_key(ef_xref, "Names")
+                if names_array[0] == "array":
+                    # Extraer todas las referencias a diccionarios FileSpec
+                    refs = re.findall(r'(\d+)\s+0\s+R', names_array[1])
+                    for ref in refs:
+                        fs_xref = int(ref)
+                        
+                        # Inyección Regla 6.8-3 (AFRelationship)
+                        doc.xref_set_key(fs_xref, "AFRelationship", "/Unspecified")
+                        af_xrefs.append(fs_xref)
+                        
+                        # Aseguramos la Regla 6.8-1 (MIME Type) por precaución
+                        ef_dict = doc.xref_get_key(fs_xref, "EF")
+                        if ef_dict[0] == "dict":
+                            stream_refs = re.findall(r'(\d+)\s+0\s+R', ef_dict[1])
+                            for s_ref in stream_refs:
+                                doc.xref_set_key(int(s_ref), "Subtype", "/application#2Foctet-stream")
+    except Exception:
+        pass
+        
+    # 2. Respaldo de escaneo global (Por si el árbol Names es complejo o tiene /Kids)
     for xref in range(1, doc.xref_length()):
         try:
             keys = doc.xref_get_keys(xref)
-            
-            # 1. Inyección para el FileSpec (Contenedor del anexo)
-            # Detección infalible: Si tiene las claves de anexo EF y nombre UF
-            if "EF" in keys and "UF" in keys:
+            if "EF" in keys and "UF" in keys and xref not in af_xrefs:
                 doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
-                doc.xref_set_key(xref, "Type", "/Filespec") # Forzamos la etiqueta estructural
                 af_xrefs.append(xref)
                 
-            # 2. Inyección para el EmbeddedFile (Los datos puros MIME)
-            elif "Type" in keys:
-                type_val = doc.xref_get_key(xref, "Type")
-                if type_val[0] == "name" and type_val[1] == "/EmbeddedFile":
-                    subtype_val = doc.xref_get_key(xref, "Subtype")
-                    if subtype_val[0] == "null" or subtype_val[1] == "":
-                        doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
+                ef_dict = doc.xref_get_key(xref, "EF")
+                if ef_dict[0] == "dict":
+                    stream_refs = re.findall(r'(\d+)\s+0\s+R', ef_dict[1])
+                    for s_ref in stream_refs:
+                        doc.xref_set_key(int(s_ref), "Subtype", "/application#2Foctet-stream")
         except Exception:
             continue
             
-    # 3. Registrar oficialmente en el Catálogo como Archivos Asociados (/AF)
+    # 3. Inyección Regla 6.8-4 (Matricular el anexo en el catálogo maestro como Archivo Asociado)
     if af_xrefs:
         af_str = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
         try:
@@ -72,7 +98,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # 1. Rescatar y ELIMINAR anexos del archivo original (Previene duplicados)
+    # 1. Rescatar y purgar anexos del archivo original para evitar duplicidad
     attachments = []
     try:
         doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -87,7 +113,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     except Exception:
         pass
     
-    # 2. Conversión Ghostscript (Genera el esqueleto base normado)
+    # 2. Conversión Ghostscript
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -112,17 +138,22 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        # 3. Ensamblaje Estructural de Anexos
+        # 3. Inserción de Anexos
         doc = pymupdf.open(temp_out_path)
         
         if level == "3b" and attachments:
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name, ufilename=name)
             
-            # Ejecutar inyección de diccionarios
+            # EL PUENTE: Guardamos en memoria para forzar la creación estructural de diccionarios
+            temp_pdf_bytes = doc.write()
+            doc.close()
+            
+            # Reabrimos el documento para navegar los diccionarios reales e inyectar validaciones
+            doc = pymupdf.open(stream=temp_pdf_bytes, filetype="pdf")
             fix_pdfa_attachment_dictionaries(doc)
         
-        # 4. Inyección Final XMP
+        # 4. Inyección Final de Metadatos XMP
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -285,7 +316,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v11.2", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v12.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -322,7 +353,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v11.2)")
+    st.title("📄 Herramienta de Preservación Documental (v12.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
