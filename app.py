@@ -92,7 +92,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                 pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
                 
             for name, file_data in attachments:
-                # Inyección 6.8-1: Stream de datos y MIME (Texto plano, pikepdf lo escapa solo)
+                # Inyección 6.8-1: Stream de datos y MIME
                 ef_stream = pdf.make_stream(file_data)
                 ef_stream.Type = pikepdf.Name("/EmbeddedFile")
                 ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
@@ -106,7 +106,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                     AFRelationship=pikepdf.Name("/Unspecified")
                 )
                 
-                # LA CLAVE DE ORO: make_indirect convierte el diccionario en un puntero (ej. 12 0 R)
+                # LA CLAVE DE ORO: make_indirect convierte el diccionario en un puntero
                 filespec_obj = pdf.make_indirect(filespec_dict)
                 
                 # Matriculamos el MISMO puntero en ambos lados
@@ -114,7 +114,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                 pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
                 pdf.Root.AF.append(filespec_obj)
                 
-        # 4. Inyección XML XMP puramente nativa con pikepdf
+        # 4. Inyección Final de Metadatos XML XMP (De vuelta a PyMuPDF)
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -308,7 +308,8 @@ with col_menu:
                 "2. Adjuntar Cualquier Archivo",
                 "3. Convertir a PDF/A-2b",
                 "4. Convertir a PDF/A-3b (Archivos Híbridos)",
-                "5. Generar Informe de Preservación"
+                "5. Generar Informe de Preservación",
+                "6. Extraer Metadatos del PDF"
             )
         )
     else:
@@ -345,7 +346,7 @@ with col_main:
                 st.subheader(menu_option)
                 level = "3b" if "3b" in menu_option else "2b"
                 if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
-                    with st.spinner("Construyendo matriz estructural de objetos indirectos..."):
+                    with st.spinner("Construyendo matriz estructural y codificando a norma..."):
                         result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
                         if result_pdfa:
                             st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
@@ -359,6 +360,31 @@ with col_main:
                             st.markdown(f"**{k}:** {v}")
                         report_text = "\n".join([f"{k}: {v}" for k, v in report.items()])
                         st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
+
+            elif "6. Extraer Metadatos" in menu_option:
+                st.subheader("🗂️ Extracción Completa de Metadatos")
+                if st.button("Extraer y Analizar"):
+                    with st.spinner("Leyendo diccionarios y estructura XML..."):
+                        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                        
+                        # 1. Metadatos Estándar (Diccionario interno)
+                        st.markdown("### Metadatos Estándar (Diccionario PDF)")
+                        std_meta = doc.metadata
+                        if std_meta:
+                            meta_df = pd.DataFrame([{"Propiedad": k, "Valor": v} for k, v in std_meta.items() if v])
+                            st.table(meta_df)
+                        else:
+                            st.info("El documento no tiene metadatos estándar legibles.")
+                            
+                        # 2. Metadatos XMP (Estructura XML)
+                        st.markdown("### Metadatos XMP (Estructura XML)")
+                        xmp_meta = doc.get_xml_metadata()
+                        if xmp_meta:
+                            st.code(xmp_meta, language="xml")
+                        else:
+                            st.info("Este documento no contiene metadatos XMP incrustados (Ausencia de firma PDF/A).")
+                            
+                        doc.close()
 
     else:
         st.subheader("📁 Índice Electrónico de Expedientes Multiformato")
