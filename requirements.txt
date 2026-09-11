@@ -4,3 +4,4 @@ pypdf
 pandas
 openpyxl
 nc-py-api
+pikepdf
