@@ -25,62 +25,45 @@ def parse_pdf_date(date_str):
     return str(date_str) 
 
 def fix_pdfa_attachment_dictionaries(doc):
-    """Navega el árbol de nombres del PDF para inyectar las reglas 6.8-3 y 6.8-4 de veraPDF de forma precisa"""
+    """Escanea el ADN absoluto del PDF para inyectar las reglas 6.8 de veraPDF sin fallos de jerarquía"""
     catalog_xref = doc.pdf_catalog()
     af_xrefs = []
     
-    # 1. Navegación directa por la jerarquía exacta que escanea veraPDF: Catalog -> Names -> EmbeddedFiles
-    try:
-        names_val = doc.xref_get_key(catalog_xref, "Names")
-        if names_val[0] == "xref":
-            names_xref = int(names_val[1].split()[0])
-            
-            ef_val = doc.xref_get_key(names_xref, "EmbeddedFiles")
-            if ef_val[0] == "xref":
-                ef_xref = int(ef_val[1].split()[0])
-                
-                # Accedemos a la matriz de nombres de los archivos adjuntos
-                names_array = doc.xref_get_key(ef_xref, "Names")
-                if names_array[0] == "array":
-                    # Extraer todas las referencias a diccionarios FileSpec
-                    refs = re.findall(r'(\d+)\s+0\s+R', names_array[1])
-                    for ref in refs:
-                        fs_xref = int(ref)
-                        
-                        # Inyección Regla 6.8-3 (AFRelationship)
-                        doc.xref_set_key(fs_xref, "AFRelationship", "/Unspecified")
-                        af_xrefs.append(fs_xref)
-                        
-                        # Aseguramos la Regla 6.8-1 (MIME Type) por precaución
-                        ef_dict = doc.xref_get_key(fs_xref, "EF")
-                        if ef_dict[0] == "dict":
-                            stream_refs = re.findall(r'(\d+)\s+0\s+R', ef_dict[1])
-                            for s_ref in stream_refs:
-                                doc.xref_set_key(int(s_ref), "Subtype", "/application#2Foctet-stream")
-    except Exception:
-        pass
-        
-    # 2. Respaldo de escaneo global (Por si el árbol Names es complejo o tiene /Kids)
+    # Barrido objeto por objeto para interceptar los diccionarios huérfanos
     for xref in range(1, doc.xref_length()):
         try:
             keys = doc.xref_get_keys(xref)
-            if "EF" in keys and "UF" in keys and xref not in af_xrefs:
+            
+            # Identificador inconfundible de un FileSpec (Contenedor de Anexos)
+            is_filespec = False
+            type_val = doc.xref_get_key(xref, "Type")
+            if type_val[0] == "name" and type_val[1] == "/Filespec":
+                is_filespec = True
+            elif "EF" in keys and ("UF" in keys or "F" in keys):
+                is_filespec = True
+                
+            if is_filespec:
+                # Inyección Regla 6.8-3: Relación explícita
                 doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
+                doc.xref_set_key(xref, "Type", "/Filespec") 
                 af_xrefs.append(xref)
                 
-                ef_dict = doc.xref_get_key(xref, "EF")
-                if ef_dict[0] == "dict":
-                    stream_refs = re.findall(r'(\d+)\s+0\s+R', ef_dict[1])
-                    for s_ref in stream_refs:
-                        doc.xref_set_key(int(s_ref), "Subtype", "/application#2Foctet-stream")
+                # Inyección Regla 6.8-1: MIME Type puro en el stream de datos
+                ef_val = doc.xref_get_key(xref, "EF")
+                if ef_val[1] != "null":
+                    streams = re.findall(r'(\d+)\s+0\s+R', ef_val[1])
+                    for s in streams:
+                        s_xref = int(s)
+                        doc.xref_set_key(s_xref, "Type", "/EmbeddedFile")
+                        doc.xref_set_key(s_xref, "Subtype", "/application#2Foctet-stream")
         except Exception:
             continue
             
-    # 3. Inyección Regla 6.8-4 (Matricular el anexo en el catálogo maestro como Archivo Asociado)
+    # Inyección Regla 6.8-4: Matricular Archivos Asociados en el Catálogo
     if af_xrefs:
-        af_str = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
+        af_array = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
         try:
-            doc.xref_set_key(catalog_xref, "AF", af_str)
+            doc.xref_set_key(catalog_xref, "AF", af_array)
         except Exception:
             pass
 
@@ -113,7 +96,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     except Exception:
         pass
     
-    # 2. Conversión Ghostscript
+    # 2. Conversión Ghostscript (Genera esqueleto base normado)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -145,14 +128,11 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             for name, file_data in attachments:
                 doc.embfile_add(name, file_data, filename=name, ufilename=name)
             
-            # EL PUENTE: Guardamos en memoria para forzar la creación estructural de diccionarios
+            # Puente de memoria: Guardar y reabrir para forzar construcción de índices de xref
             temp_pdf_bytes = doc.write()
             doc.close()
-            
-            # Reabrimos el documento para navegar los diccionarios reales e inyectar validaciones
             doc = pymupdf.open(stream=temp_pdf_bytes, filetype="pdf")
-            fix_pdfa_attachment_dictionaries(doc)
-        
+            
         # 4. Inyección Final de Metadatos XMP
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
@@ -166,6 +146,11 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
 <?xpacket end="w"?>"""
         
         doc.set_xml_metadata(xml_metadata)
+        
+        # 5. Inyección estructural de validadores justo antes de la escritura final
+        if level == "3b" and attachments:
+            fix_pdfa_attachment_dictionaries(doc)
+            
         pdfa_bytes = doc.write()
         doc.close()
         return pdfa_bytes
@@ -316,7 +301,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v12.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v13.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -353,7 +338,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v12.0)")
+    st.title("📄 Herramienta de Preservación Documental (v13.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
