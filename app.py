@@ -1,5 +1,6 @@
 import streamlit as st
-import pymupdf  # Reemplazo oficial de fitz
+import pymupdf  # Para lectura y metadatos XMP
+import pikepdf  # EL NUEVO MOTOR PARA CUMPLIMIENTO PDF/A-3
 import pandas as pd
 from nc_py_api import Nextcloud
 from io import BytesIO
@@ -15,7 +16,6 @@ import re
 # ==========================================
 
 def parse_pdf_date(date_str):
-    """Convierte la fecha interna del PDF a YYYY-MM-DD HH:MM:SS para lectura y ordenamiento"""
     if not date_str:
         return "Desconocida"
     match = re.search(r"D:(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", date_str)
@@ -24,68 +24,12 @@ def parse_pdf_date(date_str):
         return f"{y}-{m}-{d} {h}:{mn}:{s}"
     return str(date_str) 
 
-def fix_pdfa_attachment_dictionaries(doc):
-    """Navega el árbol oficial del PDF para inyectar las reglas 6.8 de veraPDF de forma quirúrgica"""
-    catalog_xref = doc.pdf_catalog()
-    af_xrefs = []
-    
-    # 1. Navegación directa al diccionario de Nombres
-    names_val = doc.xref_get_key(catalog_xref, "Names")
-    if names_val[0] != "xref": return
-    names_xref = int(names_val[1].split()[0])
-    
-    # 2. Navegación directa al árbol de Archivos Incrustados
-    ef_val = doc.xref_get_key(names_xref, "EmbeddedFiles")
-    if ef_val[0] != "xref": return
-    ef_xref = int(ef_val[1].split()[0])
-    
-    # 3. Extracción de las referencias de los anexos
-    arr_val = doc.xref_get_key(ef_xref, "Names")
-    refs = []
-    if arr_val[0] == "array":
-        refs = re.findall(r'(\d+)\s+0\s+R', arr_val[1])
-    elif arr_val[0] == "xref":
-        arr_xref = int(arr_val[1].split()[0])
-        obj_str = doc.xref_object(arr_xref)
-        refs = re.findall(r'(\d+)\s+0\s+R', obj_str)
-        
-    # 4. Inyección de metadatos en cada anexo encontrado
-    for fs in refs:
-        fs_xref = int(fs)
-        af_xrefs.append(fs_xref)
-        
-        # Regla 6.8-3: Relación explícita
-        doc.xref_set_key(fs_xref, "AFRelationship", "/Unspecified")
-        doc.xref_set_key(fs_xref, "Type", "/Filespec")
-        
-        # Regla 6.8-1: MIME Type puro en el stream de datos
-        ef_dict = doc.xref_get_key(fs_xref, "EF")
-        stream_refs = []
-        if ef_dict[0] == "dict":
-            stream_refs = re.findall(r'(\d+)\s+0\s+R', ef_dict[1])
-        elif ef_dict[0] == "xref":
-            ef_dict_xref = int(ef_dict[1].split()[0])
-            obj_str = doc.xref_object(ef_dict_xref)
-            stream_refs = re.findall(r'(\d+)\s+0\s+R', obj_str)
-            
-        for s in stream_refs:
-            s_xref = int(s)
-            doc.xref_set_key(s_xref, "Type", "/EmbeddedFile")
-            doc.xref_set_key(s_xref, "Subtype", "/application#2Foctet-stream")
-            
-    # 5. Regla 6.8-4: Matricular en el Catálogo Maestro como Archivo Asociado
-    if af_xrefs:
-        af_str = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
-        try:
-            doc.xref_set_key(catalog_xref, "AF", af_str)
-        except Exception:
-            pass
-
 # ==========================================
 # FUNCIONES PRINCIPALES
 # ==========================================
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
+    # Usamos pymupdf para incrustaciones sencillas (fuera de PDF/A)
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
     return doc.write()
@@ -95,7 +39,7 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # 1. Rescatar y purgar anexos del archivo original (Previene duplicidad y limpia memoria)
+    # 1. Rescatar y ELIMINAR anexos para procesar un PDF limpio en Ghostscript
     attachments = []
     try:
         doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -105,13 +49,12 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         for name in doc_original.embfile_names():
             doc_original.embfile_del(name)
             
-        # El garbage=4 destruye los diccionarios huérfanos antes de enviarlos a Ghostscript
         pdf_bytes = doc_original.write(garbage=4)
         doc_original.close()
     except Exception:
         pass
     
-    # 2. Conversión Ghostscript (Genera esqueleto base normado)
+    # 2. Conversión Ghostscript (Construye el lienzo base normado)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -136,17 +79,47 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        # 3. Inserción de Anexos Estructurales
-        doc = pymupdf.open(temp_out_path)
-        
+        # 3. CONSTRUCCIÓN ESTRUCTURAL BLINDADA CON PIKEPDF
         if level == "3b" and attachments:
+            pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
+            
+            # Garantizamos la existencia de los diccionarios principales
+            if "/AF" not in pdf.Root:
+                pdf.Root.AF = pikepdf.Array()
+                
+            if "/Names" not in pdf.Root:
+                pdf.Root.Names = pikepdf.Dictionary()
+                
+            if "/EmbeddedFiles" not in pdf.Root.Names:
+                pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
+                
             for name, file_data in attachments:
-                doc.embfile_add(name, file_data, filename=name, ufilename=name)
+                # Inyección 6.8-1: Stream de datos y MIME
+                ef_stream = pdf.make_stream(file_data)
+                ef_stream.Type = pikepdf.Name("/EmbeddedFile")
+                ef_stream.Subtype = pikepdf.Name("/application#2Foctet-stream")
+                
+                # Inyección 6.8-3: Creación del Contenedor con AFRelationship y Etiquetas F/UF
+                filespec = pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Filespec"),
+                    F=name,
+                    UF=name,
+                    EF=pikepdf.Dictionary(F=ef_stream, UF=ef_stream),
+                    AFRelationship=pikepdf.Name("/Unspecified")
+                )
+                
+                # Guardamos el anexo en el árbol de nombres interno
+                pdf.Root.Names.EmbeddedFiles.Names.append(name)
+                pdf.Root.Names.EmbeddedFiles.Names.append(filespec)
+                
+                # Inyección 6.8-4: Matriculamos en el Catálogo principal como Archivo Asociado
+                pdf.Root.AF.append(filespec)
+                
+            pdf.save(temp_out_path)
+            pdf.close()
             
-            # Ejecutamos la inyección quirúrgica directamente en la memoria
-            fix_pdfa_attachment_dictionaries(doc)
-            
-        # 4. Inyección Final de Metadatos XMP
+        # 4. Inyección Final de Metadatos XML XMP (De vuelta a PyMuPDF)
+        doc = pymupdf.open(temp_out_path)
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -159,7 +132,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
 <?xpacket end="w"?>"""
         
         doc.set_xml_metadata(xml_metadata)
-        
         pdfa_bytes = doc.write(deflate=True)
         doc.close()
         return pdfa_bytes
@@ -310,7 +282,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v13.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v14.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -347,7 +319,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v13.0)")
+    st.title("📄 Herramienta de Preservación Documental (v14.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
@@ -370,7 +342,7 @@ with col_main:
                 st.subheader(menu_option)
                 level = "3b" if "3b" in menu_option else "2b"
                 if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
-                    with st.spinner("Procesando recodificación normada..."):
+                    with st.spinner("Construyendo matriz estructural y codificando a norma..."):
                         result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
                         if result_pdfa:
                             st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
