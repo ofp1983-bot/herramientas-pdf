@@ -1,7 +1,5 @@
 import streamlit as st
 import pymupdf  # Reemplazo oficial de fitz
-import pypdf
-from pypdf.generic import NameObject, ArrayObject
 import pandas as pd
 from nc_py_api import Nextcloud
 from io import BytesIO
@@ -26,13 +24,44 @@ def parse_pdf_date(date_str):
         return f"{y}-{m}-{d} {h}:{mn}:{s}"
     return str(date_str) 
 
+def fix_pdfa_attachment_dictionaries(doc):
+    """Inyecta de forma segura etiquetas estructurales blindadas para cumplir con veraPDF"""
+    catalog_xref = doc.pdf_catalog()
+    af_xrefs = []
+    
+    for xref in range(1, doc.xref_length()):
+        try:
+            # Obtener el tipo de forma segura (evita colapsos de memoria)
+            type_val = doc.xref_get_key(xref, "Type")
+            if type_val[0] == "name":
+                # Inyección para el FileSpec (El contenedor)
+                if type_val[1] == "/Filespec":
+                    doc.xref_set_key(xref, "AFRelationship", "/Unspecified")
+                    af_xrefs.append(xref)
+                
+                # Inyección para el EmbeddedFile (Los datos puros MIME)
+                elif type_val[1] == "/EmbeddedFile":
+                    subtype_val = doc.xref_get_key(xref, "Subtype")
+                    if subtype_val[0] == "null" or subtype_val[1] == "":
+                        doc.xref_set_key(xref, "Subtype", "/application#2Foctet-stream")
+        except Exception:
+            continue
+            
+    # Registrar oficialmente en el Catálogo como Archivos Asociados (/AF)
+    if af_xrefs:
+        af_str = "[ " + " ".join([f"{x} 0 R" for x in set(af_xrefs)]) + " ]"
+        try:
+            doc.xref_set_key(catalog_xref, "AF", af_str)
+        except Exception:
+            pass
+
 # ==========================================
 # FUNCIONES PRINCIPALES
 # ==========================================
 
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name)
+    doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, uf=attachment_name)
     return doc.write()
 
 def convert_to_pdfa(pdf_bytes, level="3b"):
@@ -40,27 +69,23 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # 1. Rescatar anexos originales
+    # 1. Rescatar y ELIMINAR anexos del archivo original (Previene duplicados)
     attachments = []
     try:
-        reader = pypdf.PdfReader(BytesIO(pdf_bytes))
-        if reader.attachments:
-            for name, byte_list in reader.attachments.items():
-                for file_data in byte_list:
-                    attachments.append((name, file_data))
+        doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        for name in doc_original.embfile_names():
+            attachments.append((name, doc_original.embfile_get(name)))
+            
+        for name in doc_original.embfile_names():
+            doc_original.embfile_del(name)
+            
+        # Sobrescribir los bytes con un PDF completamente limpio
+        pdf_bytes = doc_original.write()
+        doc_original.close()
     except Exception:
         pass
-        
-    if not attachments:
-        try:
-            doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-            for name in doc_original.embfile_names():
-                attachments.append((name, doc_original.embfile_get(name)))
-            doc_original.close()
-        except Exception:
-            pass
     
-    # 2. Conversión Ghostscript (Construye el esqueleto base)
+    # 2. Conversión Ghostscript (Genera el esqueleto base normado)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -85,62 +110,18 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        with open(temp_out_path, "rb") as f:
-            gs_pdf_bytes = f.read()
-            
-        # 3. Ensamblaje estructural nativo para PDF/A-3b usando pypdf (clone_from)
+        # 3. Ensamblaje Estructural de Anexos
+        doc = pymupdf.open(temp_out_path)
+        
         if level == "3b" and attachments:
-            reader_gs = pypdf.PdfReader(BytesIO(gs_pdf_bytes))
+            for name, file_data in attachments:
+                # El parámetro uf=name corrige el error F y UF de veraPDF
+                doc.embfile_add(name, file_data, filename=name, uf=name)
             
-            # Clonar mantiene la estructura original de Ghostscript intacta
-            writer = pypdf.PdfWriter(clone_from=reader_gs)
-            
-            # Incrustar archivos
-            for name, data in attachments:
-                writer.add_attachment(name, data)
-                
-            # Validar e inyectar estructura PDF/A-3b exacta para VeraPDF
-            root = writer.root_object
-            af_array = ArrayObject()
-            
-            names = root.get("/Names")
-            if names:
-                ef = names.get_object().get("/EmbeddedFiles")
-                if ef:
-                    ef_names = ef.get_object().get("/Names")
-                    if ef_names:
-                        # Iterar sobre el diccionario de nombres del anexo
-                        for i in range(1, len(ef_names), 2):
-                            file_spec_ref = ef_names[i]
-                            file_spec = file_spec_ref.get_object()
-                            
-                            # Inyección Regla 6.8-3: Relación del archivo
-                            file_spec[NameObject("/AFRelationship")] = NameObject("/Unspecified")
-                            file_spec[NameObject("/Type")] = NameObject("/Filespec")
-                            
-                            # Inyección Regla 6.8-4: Matricular en array /AF
-                            af_array.append(file_spec_ref)
-                            
-                            # Inyección Reglas 6.9: Subtype MIME
-                            ef_dict = file_spec.get("/EF")
-                            if ef_dict:
-                                ef_streams = ef_dict.get_object()
-                                for k, stream_ref in ef_streams.items():
-                                    stream = stream_ref.get_object()
-                                    stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
-                                    stream[NameObject("/Subtype")] = NameObject("/application#2Foctet-stream")
-                                    
-            if af_array:
-                root[NameObject("/AF")] = af_array
-                
-            out_buffer = BytesIO()
-            writer.write(out_buffer)
-            final_pdf_bytes = out_buffer.getvalue()
-        else:
-            final_pdf_bytes = gs_pdf_bytes
-            
-        # 4. Inyección Final XMP asegurada
-        doc = pymupdf.open(stream=final_pdf_bytes, filetype="pdf")
+            # Ejecutar inyección de diccionarios
+            fix_pdfa_attachment_dictionaries(doc)
+        
+        # 4. Inyección Final XMP
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -168,32 +149,28 @@ def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 def validate_pdfa(pdf_bytes):
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    xml = doc.get_xml_metadata()
-    if not xml:
-        return False, "No es PDF/A (Sin metadatos XML)"
-    part_match = re.search(r'<pdfaid:part>(\d)</pdfaid:part>', xml)
-    conf_match = re.search(r'<pdfaid:conformance>([A-Z]+)</pdfaid:conformance>', xml)
-    if part_match and conf_match:
-        return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)}"
-    return False, "No detectado"
+    try:
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        xml = doc.get_xml_metadata()
+        doc.close()
+        if not xml:
+            return False, "No es PDF/A (Sin metadatos XML)"
+        part_match = re.search(r'<pdfaid:part>(\d)</pdfaid:part>', xml)
+        conf_match = re.search(r'<pdfaid:conformance>([A-Z]+)</pdfaid:conformance>', xml)
+        if part_match and conf_match:
+            return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)}"
+        return False, "No detectado"
+    except:
+        return False, "Error al leer documento"
 
 def get_attachments_info(pdf_bytes):
     names = []
     try:
-        reader = pypdf.PdfReader(BytesIO(pdf_bytes))
-        if reader.attachments:
-            for name in reader.attachments.keys():
-                names.append(name)
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        names = list(doc.embfile_names())
+        doc.close()
     except Exception:
         pass
-    if not names:
-        try:
-            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-            names = list(doc.embfile_names())
-            doc.close()
-        except Exception:
-            pass
     return list(set(names))
 
 def generate_report(file_name, file_bytes):
@@ -307,7 +284,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v10.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v11.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -344,7 +321,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v10.0)")
+    st.title("📄 Herramienta de Preservación Documental (v11.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
