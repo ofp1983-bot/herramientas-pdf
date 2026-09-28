@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from datetime import datetime
 import re
+import xml.etree.ElementTree as ET
 
 # ==========================================
 # FUNCIONES AUXILIARES
@@ -81,6 +82,18 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
         # 3. CONSTRUCCIÓN ESTRUCTURAL BLINDADA CON PIKEPDF
         pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
         
+        # ---> INYECCIÓN REGLA 6.2.10 (Transparencias y Espacio de Color) <---
+        for page in pdf.pages:
+            if "/Group" not in page:
+                page.Group = pikepdf.Dictionary(
+                    S=pikepdf.Name("/Transparency"),
+                    CS=pikepdf.Name("/DeviceRGB")
+                )
+            else:
+                if "/CS" not in page.Group:
+                    page.Group.CS = pikepdf.Name("/DeviceRGB")
+        
+        # ---> INYECCIÓN REGLAS 6.8 (Anexos Híbridos) <---
         if level == "3b" and attachments:
             if "/AF" not in pdf.Root:
                 pdf.Root.AF = pikepdf.Array()
@@ -92,12 +105,12 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                 pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
                 
             for name, file_data in attachments:
-                # Inyección 6.8-1: Stream de datos y MIME
+                # Stream de datos y MIME
                 ef_stream = pdf.make_stream(file_data)
                 ef_stream.Type = pikepdf.Name("/EmbeddedFile")
                 ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
                 
-                # Inyección 6.8-3 y 6.8-4: Crear diccionario indirecto
+                # Crear diccionario indirecto
                 filespec_dict = pikepdf.Dictionary(
                     Type=pikepdf.Name("/Filespec"),
                     F=name,
@@ -106,15 +119,15 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                     AFRelationship=pikepdf.Name("/Unspecified")
                 )
                 
-                # LA CLAVE DE ORO: make_indirect convierte el diccionario en un puntero
+                # Convertir a puntero
                 filespec_obj = pdf.make_indirect(filespec_dict)
                 
-                # Matriculamos el MISMO puntero en ambos lados
+                # Matricular anexo
                 pdf.Root.Names.EmbeddedFiles.Names.append(name)
                 pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
                 pdf.Root.AF.append(filespec_obj)
                 
-        # 4. Inyección Final de Metadatos XML XMP (De vuelta a PyMuPDF)
+        # 4. Inyección Final de Metadatos XML XMP
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -150,6 +163,40 @@ def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 def validate_pdfa(pdf_bytes):
+    """Motor de validación híbrido (veraPDF Forense + PyMuPDF)"""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
+        temp_pdf.write(pdf_bytes)
+        temp_pdf_path = temp_pdf.name
+        
+    try:
+        process = subprocess.run(
+            f'verapdf "{temp_pdf_path}"', 
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True, 
+            encoding='utf-8', 
+            errors='ignore'
+        )
+        
+        if process.stdout and "<?xml" in process.stdout:
+            xml_str = process.stdout[process.stdout.find("<?xml"):]
+            root = ET.fromstring(xml_str)
+            
+            report_node = root.find('.//validationReport')
+            if report_node is not None:
+                is_compliant = report_node.get('isCompliant') == 'true'
+                profile_name = report_node.get('profileName', 'Desconocido')
+                profile_clean = profile_name.replace(" validation profile", "")
+                
+                estado = f"{profile_clean} (Auditoría: veraPDF)"
+                return is_compliant, estado
+    except Exception:
+        pass 
+    finally:
+        if os.path.exists(temp_pdf_path): 
+            os.remove(temp_pdf_path)
+
     try:
         doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         xml = doc.get_xml_metadata()
@@ -159,7 +206,7 @@ def validate_pdfa(pdf_bytes):
         part_match = re.search(r'<pdfaid:part>(\d)</pdfaid:part>', xml)
         conf_match = re.search(r'<pdfaid:conformance>([A-Z]+)</pdfaid:conformance>', xml)
         if part_match and conf_match:
-            return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)}"
+            return True, f"PDF/A-{part_match.group(1)}{conf_match.group(1)} (Lectura de Etiqueta)"
         return False, "No detectado"
     except:
         return False, "Error al leer documento"
@@ -185,8 +232,8 @@ def generate_report(file_name, file_bytes):
         "Hash SHA-256": sha256_hash,
         "Tamaño": f"{size_kb:.2f} KB",
         "Fecha de Análisis": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Cumplimiento PDF/A": "Válido" if is_valid else "No Cumple",
-        "Nivel PDF/A Detectado": pdfa_level,
+        "Cumplimiento PDF/A": "Válido (Normado)" if is_valid else "No Cumple (Inválido)",
+        "Nivel y Motor de Verificación": pdfa_level,
         "Contiene Anexos": "Sí" if nombres_anexos else "No",
         "Nombre de los Anexos": ", ".join(nombres_anexos) if nombres_anexos else "N/A"
     }
@@ -211,7 +258,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         
         if extension == ".pdf":
             is_valid, pdfa_level = validate_pdfa(file_bytes)
-            pdfa_final = pdfa_level if is_valid else "No detectado"
+            pdfa_final = pdfa_level.split(" ")[0] if is_valid else "No detectado"
             
             nombres_anexos = get_attachments_info(file_bytes)
             tiene_anexos = "Sí" if nombres_anexos else "No"
@@ -285,7 +332,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v16.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v17.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -323,7 +370,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v16.0)")
+    st.title("📄 Herramienta de Preservación Documental (v17.0)")
     
     if modulo == "📄 Documentos Individuales":
         main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
