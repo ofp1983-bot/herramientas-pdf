@@ -1,6 +1,6 @@
 import streamlit as st
-import pymupdf  # Para lectura y extracción
-import pikepdf  # Motor estructural puro para cumplimiento PDF/A-3
+import pymupdf  
+import pikepdf  
 import pandas as pd
 from nc_py_api import Nextcloud
 from io import BytesIO
@@ -11,6 +11,14 @@ import tempfile
 from datetime import datetime
 import re
 import xml.etree.ElementTree as ET
+
+# Librerías para comunicación nativa con Microsoft Word en Windows
+try:
+    import win32com.client
+    import pythoncom
+    WIN32_AVAILABLE = True
+except ImportError:
+    WIN32_AVAILABLE = False
 
 # ==========================================
 # FUNCIONES AUXILIARES
@@ -29,6 +37,76 @@ def parse_pdf_date(date_str):
 # FUNCIONES PRINCIPALES
 # ==========================================
 
+def convert_word_to_pdfa_native(docx_bytes, original_filename):
+    """Convierte Word a PDF/A usando el motor nativo de MS Office en Windows"""
+    if not WIN32_AVAILABLE:
+        st.error("La librería pywin32 no está instalada. Ejecuta: pip install pywin32")
+        return None
+
+    # Streamlit maneja hilos, se requiere inicializar COM en el hilo actual
+    pythoncom.CoInitialize()
+    word = None
+    doc = None
+    
+    # Crear archivos temporales con rutas absolutas (requeridas por Windows COM)
+    fd_docx, docx_path = tempfile.mkstemp(suffix=".docx")
+    fd_pdf, pdf_path = tempfile.mkstemp(suffix=".pdf")
+    
+    try:
+        with open(docx_path, "wb") as f:
+            f.write(docx_bytes)
+            
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = False 
+        
+        doc = word.Documents.Open(docx_path)
+        
+        # Parámetros de ExportAsFixedFormat
+        # wdExportFormatPDF = 17
+        # UseISO19005_1 = True (La clave para la norma PDF/A desde el origen)
+        doc.ExportAsFixedFormat(
+            OutputFileName=pdf_path,
+            ExportFormat=17,
+            OpenAfterExport=False,
+            OptimizeFor=0, 
+            Range=0, 
+            From=1,
+            To=1,
+            Item=0, 
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=1, 
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=True 
+        )
+        
+        doc.Close(False)
+        word.Quit()
+        
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+            
+        return pdf_bytes
+        
+    except Exception as e:
+        st.error(f"Error en el puente con Microsoft Word: {str(e)}")
+        return None
+    finally:
+        try:
+            if doc: doc.Close(False)
+            if word: word.Quit()
+        except:
+            pass
+        pythoncom.CoUninitialize()
+        
+        # Limpieza de temporales
+        os.close(fd_docx)
+        os.close(fd_pdf)
+        if os.path.exists(docx_path): os.remove(docx_path)
+        if os.path.exists(pdf_path): os.remove(pdf_path)
+
 def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
     doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
     doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
@@ -39,7 +117,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     part = "3" if level == "3b" else "2"
     conformance = "B"
     
-    # 1. Rescatar y ELIMINAR anexos para procesar un PDF limpio en Ghostscript
     attachments = []
     try:
         doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
@@ -54,7 +131,6 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
     except Exception:
         pass
     
-    # 2. Conversión Ghostscript (Construye el lienzo base normado)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
         temp_in.write(pdf_bytes)
         temp_in_path = temp_in.name
@@ -67,9 +143,8 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             "-dPDFA=" + part,
             "-dBATCH",
             "-dNOPAUSE",
-            "-dColorConversionStrategy=/UseDeviceIndependentColor",
+            "-sColorConversionStrategy=RGB",
             "-sDEVICE=pdfwrite",
-            "-dPDFACompatibilityPolicy=1",
             f"-sOutputFile={temp_out_path}",
             temp_in_path
         ]
@@ -79,10 +154,17 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             st.error(f"Fallo en Ghostscript: {process.stderr}")
             return None
             
-        # 3. CONSTRUCCIÓN ESTRUCTURAL BLINDADA CON PIKEPDF
         pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
         
-        # ---> INYECCIÓN REGLA 6.2.10 (Transparencias y Espacio de Color) <---
+        cal_rgb = pikepdf.Array([
+            pikepdf.Name("/CalRGB"),
+            pikepdf.Dictionary(
+                WhitePoint=pikepdf.Array([0.9505, 1.0000, 1.0890]),
+                Gamma=pikepdf.Array([2.2, 2.2, 2.2]),
+                Matrix=pikepdf.Array([0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505])
+            )
+        ])
+        
         for page in pdf.pages:
             if "/Group" not in page:
                 page.Group = pikepdf.Dictionary(
@@ -92,8 +174,15 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
             else:
                 if "/CS" not in page.Group:
                     page.Group.CS = pikepdf.Name("/DeviceRGB")
+                    
+            if "/Resources" not in page:
+                page.Resources = pikepdf.Dictionary()
+            if "/ColorSpace" not in page.Resources:
+                page.Resources.ColorSpace = pikepdf.Dictionary()
+                
+            if "/DefaultRGB" not in page.Resources.ColorSpace:
+                page.Resources.ColorSpace.DefaultRGB = cal_rgb
         
-        # ---> INYECCIÓN REGLAS 6.8 (Anexos Híbridos) <---
         if level == "3b" and attachments:
             if "/AF" not in pdf.Root:
                 pdf.Root.AF = pikepdf.Array()
@@ -105,12 +194,10 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                 pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
                 
             for name, file_data in attachments:
-                # Stream de datos y MIME
                 ef_stream = pdf.make_stream(file_data)
                 ef_stream.Type = pikepdf.Name("/EmbeddedFile")
                 ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
                 
-                # Crear diccionario indirecto
                 filespec_dict = pikepdf.Dictionary(
                     Type=pikepdf.Name("/Filespec"),
                     F=name,
@@ -119,15 +206,12 @@ def convert_to_pdfa(pdf_bytes, level="3b"):
                     AFRelationship=pikepdf.Name("/Unspecified")
                 )
                 
-                # Convertir a puntero
                 filespec_obj = pdf.make_indirect(filespec_dict)
                 
-                # Matricular anexo
                 pdf.Root.Names.EmbeddedFiles.Names.append(name)
                 pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
                 pdf.Root.AF.append(filespec_obj)
                 
-        # 4. Inyección Final de Metadatos XML XMP
         xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -163,7 +247,6 @@ def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
 
 def validate_pdfa(pdf_bytes):
-    """Motor de validación híbrido (veraPDF Forense + PyMuPDF)"""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
         temp_pdf.write(pdf_bytes)
         temp_pdf_path = temp_pdf.name
@@ -332,7 +415,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v17.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v19.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -356,7 +439,8 @@ with col_menu:
                 "3. Convertir a PDF/A-2b",
                 "4. Convertir a PDF/A-3b (Archivos Híbridos)",
                 "5. Generar Informe de Preservación",
-                "6. Extraer Metadatos del PDF"
+                "6. Extraer Metadatos del PDF",
+                "7. Transformar Word a PDF/A nativo"
             )
         )
     else:
@@ -370,112 +454,136 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v17.0)")
+    st.title("📄 Herramienta de Preservación Documental (v19.0)")
     
     if modulo == "📄 Documentos Individuales":
-        main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
         
-        if main_pdf is not None:
-            pdf_bytes = main_pdf.read()
+        # Flujo exclusivo para Transformación Word
+        if "7. Transformar Word" in menu_option:
+            st.subheader("📝 Exportación Nativa de Word a PDF/A")
+            st.write("Genera un documento PDF preservado utilizando el motor original de Microsoft Word.")
+            
+            word_file = st.file_uploader("Sube el archivo Word (.docx, .doc)", type=["docx", "doc"])
+            
+            if word_file and st.button("Ejecutar Transformación Nativa"):
+                with st.spinner("Conectando con Microsoft Word..."):
+                    pdfa_result = convert_word_to_pdfa_native(word_file.read(), word_file.name)
+                    
+                    if pdfa_result:
+                        st.success("¡Documento transformado exitosamente bajo el estándar de preservación!")
+                        new_name = os.path.splitext(word_file.name)[0] + "_PDFA.pdf"
+                        st.download_button(
+                            label="Descargar PDF/A Nativo",
+                            data=pdfa_result,
+                            file_name=new_name,
+                            mime="application/pdf"
+                        )
+        
+        # Flujo estándar para PDFs
+        else:
+            main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
+            
+            if main_pdf is not None:
+                pdf_bytes = main_pdf.read()
 
-            if "1. Anexar" in menu_option or "2. Adjuntar" in menu_option:
-                st.subheader(menu_option)
-                allowed = ["xlsx", "xls"] if "Excel" in menu_option else None
-                attachment = st.file_uploader("Sube el archivo a adjuntar", type=allowed)
-                
-                if attachment and st.button("Embeber Archivo"):
-                    with st.spinner("Embebiendo archivo..."):
-                        result_pdf = embed_file_in_pdf(pdf_bytes, attachment.read(), attachment.name)
-                        st.success("¡Archivo adjuntado con éxito!")
-                        st.download_button("Descargar PDF con Anexo", result_pdf, file_name=f"con_anexo_{main_pdf.name}", mime="application/pdf")
+                if "1. Anexar" in menu_option or "2. Adjuntar" in menu_option:
+                    st.subheader(menu_option)
+                    allowed = ["xlsx", "xls"] if "Excel" in menu_option else None
+                    attachment = st.file_uploader("Sube el archivo a adjuntar", type=allowed)
+                    
+                    if attachment and st.button("Embeber Archivo"):
+                        with st.spinner("Embebiendo archivo..."):
+                            result_pdf = embed_file_in_pdf(pdf_bytes, attachment.read(), attachment.name)
+                            st.success("¡Archivo adjuntado con éxito!")
+                            st.download_button("Descargar PDF con Anexo", result_pdf, file_name=f"con_anexo_{main_pdf.name}", mime="application/pdf")
 
-            elif "Convertir a PDF/A" in menu_option:
-                st.subheader(menu_option)
-                level = "3b" if "3b" in menu_option else "2b"
-                if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
-                    with st.spinner("Construyendo matriz estructural y codificando a norma..."):
-                        result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
-                        if result_pdfa:
-                            st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
+                elif "Convertir a PDF/A" in menu_option:
+                    st.subheader(menu_option)
+                    level = "3b" if "3b" in menu_option else "2b"
+                    if st.button(f"Ejecutar Conversión a PDF/A-{level}"):
+                        with st.spinner("Construyendo matriz estructural y codificando a norma..."):
+                            result_pdfa = convert_to_pdfa(pdf_bytes, level=level)
+                            if result_pdfa:
+                                st.download_button(f"Descargar PDF/A-{level}", result_pdfa, file_name=f"pdfa_{level}_{main_pdf.name}", mime="application/pdf")
 
-            elif "5. Generar Informe" in menu_option:
-                st.subheader("📊 Informe de Preservación")
-                if st.button("Ejecutar Análisis"):
-                    with st.spinner("Analizando..."):
-                        report = generate_report(main_pdf.name, pdf_bytes)
-                        for k, v in report.items():
-                            st.markdown(f"**{k}:** {v}")
-                        report_text = "\n".join([f"{k}: {v}" for k, v in report.items()])
-                        st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
+                elif "5. Generar Informe" in menu_option:
+                    st.subheader("📊 Informe de Preservación")
+                    if st.button("Ejecutar Análisis"):
+                        with st.spinner("Analizando..."):
+                            report = generate_report(main_pdf.name, pdf_bytes)
+                            for k, v in report.items():
+                                st.markdown(f"**{k}:** {v}")
+                            report_text = "\n".join([f"{k}: {v}" for k, v in report.items()])
+                            st.download_button("Descargar Informe (.txt)", report_text, file_name=f"informe_{main_pdf.name}.txt", mime="text/plain")
 
-            elif "6. Extraer Metadatos" in menu_option:
-                st.subheader("🗂️ Extracción Forense Absoluta de Metadatos")
-                if st.button("Ejecutar Escáner Profundo"):
-                    with st.spinner("Analizando diccionarios y estructura interna..."):
-                        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-                        pdf_pike = pikepdf.Pdf.open(BytesIO(pdf_bytes))
-                        
-                        st.markdown("### 📄 1. Propiedades Físicas y de Seguridad")
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.write(f"**Total de Páginas:** {doc.page_count}")
-                            st.write(f"**Versión PDF:** {doc.metadata.get('format', 'Desconocido')}")
-                        with col2:
-                            st.write(f"**Cifrado:** {'Sí (Protegido)' if doc.is_encrypted else 'No'}")
-                            st.write(f"**Anexos detectados:** {doc.embfile_count()}")
-
-                        st.markdown("---")
-                        st.markdown("### 🏷️ 2. Diccionario de Información (`/Info`)")
-                        st.write("Metadatos tradicionales y campos ocultos inyectados por el software creador.")
-                        info_dict = {}
-                        if hasattr(pdf_pike, 'docinfo'):
-                            for key, value in pdf_pike.docinfo.items():
-                                info_dict[str(key)] = str(value)
-                        
-                        if info_dict:
-                            st.json(info_dict)
-                        else:
-                            st.info("El diccionario /Info está vacío o no existe en este documento.")
-
-                        st.markdown("---")
-                        st.markdown("### 🏗️ 3. Estructura del Catálogo Maestro (`/Root`)")
-                        st.write("El 'cerebro' del documento. Revela formularios (`/AcroForm`), esquemas de color (`/OutputIntents`) y firmas digitales.")
-                        root_dict = {}
-                        for key, value in pdf_pike.Root.items():
-                            if str(key) == "/Pages":
-                                root_dict[str(key)] = f"[Árbol de Páginas Oculto para evitar saturación: {len(pdf_pike.pages)} páginas]"
-                            else:
-                                val_str = str(value)
-                                if len(val_str) > 200:
-                                    val_str = val_str[:200] + "... [Contenido truncado]"
-                                root_dict[str(key)] = val_str
-                        st.json(root_dict)
-
-                        st.markdown("---")
-                        st.markdown("### 📎 4. Metadatos de Archivos Asociados (Anexos)")
-                        if doc.embfile_count() > 0:
-                            for anexo in doc.embfile_names():
-                                info = doc.embfile_info(anexo)
-                                size_kb = info.get('size', 0) / 1024
-                                st.write(f"**Archivo:** `{anexo}`")
-                                st.write(f"- **Tamaño:** {size_kb:.2f} KB")
-                                st.write(f"- **Descripción:** {info.get('desc', 'N/A')}")
-                                st.write(f"- **Fecha Modificación:** {info.get('modDate', 'N/A')}")
-                        else:
-                            st.info("No hay archivos incrustados en este documento.")
-
-                        st.markdown("---")
-                        st.markdown("### 🧩 5. Capa XMP Completa (XML Crudo)")
-                        st.write("Aquí residen las firmas PDF/A y los esquemas de preservación extensibles.")
-                        xmp_meta = doc.get_xml_metadata()
-                        if xmp_meta:
-                            with st.expander("Ver estructura XML completa", expanded=True):
-                                st.code(xmp_meta, language="xml")
-                        else:
-                            st.warning("Este documento no contiene capa XMP incrustada.")
+                elif "6. Extraer Metadatos" in menu_option:
+                    st.subheader("🗂️ Extracción Forense Absoluta de Metadatos")
+                    if st.button("Ejecutar Escáner Profundo"):
+                        with st.spinner("Analizando diccionarios y estructura interna..."):
+                            doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                            pdf_pike = pikepdf.Pdf.open(BytesIO(pdf_bytes))
                             
-                        doc.close()
-                        pdf_pike.close()
+                            st.markdown("### 📄 1. Propiedades Físicas y de Seguridad")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write(f"**Total de Páginas:** {doc.page_count}")
+                                st.write(f"**Versión PDF:** {doc.metadata.get('format', 'Desconocido')}")
+                            with col2:
+                                st.write(f"**Cifrado:** {'Sí (Protegido)' if doc.is_encrypted else 'No'}")
+                                st.write(f"**Anexos detectados:** {doc.embfile_count()}")
+
+                            st.markdown("---")
+                            st.markdown("### 🏷️ 2. Diccionario de Información (`/Info`)")
+                            st.write("Metadatos tradicionales y campos ocultos inyectados por el software creador.")
+                            info_dict = {}
+                            if hasattr(pdf_pike, 'docinfo'):
+                                for key, value in pdf_pike.docinfo.items():
+                                    info_dict[str(key)] = str(value)
+                            
+                            if info_dict:
+                                st.json(info_dict)
+                            else:
+                                st.info("El diccionario /Info está vacío o no existe en este documento.")
+
+                            st.markdown("---")
+                            st.markdown("### 🏗️ 3. Estructura del Catálogo Maestro (`/Root`)")
+                            st.write("El 'cerebro' del documento. Revela formularios (`/AcroForm`), esquemas de color (`/OutputIntents`) y firmas digitales.")
+                            root_dict = {}
+                            for key, value in pdf_pike.Root.items():
+                                if str(key) == "/Pages":
+                                    root_dict[str(key)] = f"[Árbol de Páginas Oculto para evitar saturación: {len(pdf_pike.pages)} páginas]"
+                                else:
+                                    val_str = str(value)
+                                    if len(val_str) > 200:
+                                        val_str = val_str[:200] + "... [Contenido truncado]"
+                                    root_dict[str(key)] = val_str
+                            st.json(root_dict)
+
+                            st.markdown("---")
+                            st.markdown("### 📎 4. Metadatos de Archivos Asociados (Anexos)")
+                            if doc.embfile_count() > 0:
+                                for anexo in doc.embfile_names():
+                                    info = doc.embfile_info(anexo)
+                                    size_kb = info.get('size', 0) / 1024
+                                    st.write(f"**Archivo:** `{anexo}`")
+                                    st.write(f"- **Tamaño:** {size_kb:.2f} KB")
+                                    st.write(f"- **Descripción:** {info.get('desc', 'N/A')}")
+                                    st.write(f"- **Fecha Modificación:** {info.get('modDate', 'N/A')}")
+                            else:
+                                st.info("No hay archivos incrustados en este documento.")
+
+                            st.markdown("---")
+                            st.markdown("### 🧩 5. Capa XMP Completa (XML Crudo)")
+                            st.write("Aquí residen las firmas PDF/A y los esquemas de preservación extensibles.")
+                            xmp_meta = doc.get_xml_metadata()
+                            if xmp_meta:
+                                with st.expander("Ver estructura XML completa", expanded=True):
+                                    st.code(xmp_meta, language="xml")
+                            else:
+                                st.warning("Este documento no contiene capa XMP incrustada.")
+                                
+                            doc.close()
+                            pdf_pike.close()
 
     else:
         st.subheader("📁 Índice Electrónico de Expedientes Multiformato")
