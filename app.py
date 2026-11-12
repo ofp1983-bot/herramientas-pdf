@@ -11,6 +11,7 @@ import tempfile
 from datetime import datetime
 import re
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 # Librerías para comunicación nativa con Microsoft Word en Windows
 try:
@@ -26,222 +27,15 @@ except ImportError:
 
 def parse_pdf_date(date_str):
     if not date_str:
-        return "Desconocida"
+        return None
     match = re.search(r"D:(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})", date_str)
     if match:
         y, m, d, h, mn, s = match.groups()
-        return f"{y}-{m}-{d} {h}:{mn}:{s}"
-    return str(date_str) 
-
-# ==========================================
-# FUNCIONES PRINCIPALES
-# ==========================================
-
-def convert_word_to_pdfa_native(docx_bytes, original_filename):
-    """Convierte Word a PDF/A usando el motor nativo de MS Office en Windows"""
-    if not WIN32_AVAILABLE:
-        st.error("La librería pywin32 no está instalada. Ejecuta: pip install pywin32")
-        return None
-
-    # Streamlit maneja hilos, se requiere inicializar COM en el hilo actual
-    pythoncom.CoInitialize()
-    word = None
-    doc = None
-    
-    # Crear archivos temporales con rutas absolutas (requeridas por Windows COM)
-    fd_docx, docx_path = tempfile.mkstemp(suffix=".docx")
-    fd_pdf, pdf_path = tempfile.mkstemp(suffix=".pdf")
-    
-    try:
-        with open(docx_path, "wb") as f:
-            f.write(docx_bytes)
-            
-        word = win32com.client.DispatchEx("Word.Application")
-        word.Visible = False
-        word.DisplayAlerts = False 
-        
-        doc = word.Documents.Open(docx_path)
-        
-        # Parámetros de ExportAsFixedFormat
-        # wdExportFormatPDF = 17
-        # UseISO19005_1 = True (La clave para la norma PDF/A desde el origen)
-        doc.ExportAsFixedFormat(
-            OutputFileName=pdf_path,
-            ExportFormat=17,
-            OpenAfterExport=False,
-            OptimizeFor=0, 
-            Range=0, 
-            From=1,
-            To=1,
-            Item=0, 
-            IncludeDocProps=True,
-            KeepIRM=True,
-            CreateBookmarks=1, 
-            DocStructureTags=True,
-            BitmapMissingFonts=True,
-            UseISO19005_1=True 
-        )
-        
-        doc.Close(False)
-        word.Quit()
-        
-        with open(pdf_path, "rb") as f:
-            pdf_bytes = f.read()
-            
-        return pdf_bytes
-        
-    except Exception as e:
-        st.error(f"Error en el puente con Microsoft Word: {str(e)}")
-        return None
-    finally:
         try:
-            if doc: doc.Close(False)
-            if word: word.Quit()
-        except:
-            pass
-        pythoncom.CoUninitialize()
-        
-        # Limpieza de temporales
-        os.close(fd_docx)
-        os.close(fd_pdf)
-        if os.path.exists(docx_path): os.remove(docx_path)
-        if os.path.exists(pdf_path): os.remove(pdf_path)
-
-def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
-    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-    doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
-    return doc.write()
-
-def convert_to_pdfa(pdf_bytes, level="3b"):
-    gs_cmd = "gswin64c" if os.name == "nt" else "gs"
-    part = "3" if level == "3b" else "2"
-    conformance = "B"
-    
-    attachments = []
-    try:
-        doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        for name in doc_original.embfile_names():
-            attachments.append((name, doc_original.embfile_get(name)))
-            
-        for name in doc_original.embfile_names():
-            doc_original.embfile_del(name)
-            
-        pdf_bytes = doc_original.write(garbage=4)
-        doc_original.close()
-    except Exception:
-        pass
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
-        temp_in.write(pdf_bytes)
-        temp_in_path = temp_in.name
-        
-    temp_out_path = temp_in_path.replace(".pdf", "_out.pdf")
-    
-    try:
-        cmd = [
-            gs_cmd,
-            "-dPDFA=" + part,
-            "-dBATCH",
-            "-dNOPAUSE",
-            "-sColorConversionStrategy=RGB",
-            "-sDEVICE=pdfwrite",
-            f"-sOutputFile={temp_out_path}",
-            temp_in_path
-        ]
-        
-        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if process.returncode != 0:
-            st.error(f"Fallo en Ghostscript: {process.stderr}")
+            return datetime(int(y), int(m), int(d), int(h), int(mn), int(s))
+        except ValueError:
             return None
-            
-        pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
-        
-        cal_rgb = pikepdf.Array([
-            pikepdf.Name("/CalRGB"),
-            pikepdf.Dictionary(
-                WhitePoint=pikepdf.Array([0.9505, 1.0000, 1.0890]),
-                Gamma=pikepdf.Array([2.2, 2.2, 2.2]),
-                Matrix=pikepdf.Array([0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505])
-            )
-        ])
-        
-        for page in pdf.pages:
-            if "/Group" not in page:
-                page.Group = pikepdf.Dictionary(
-                    S=pikepdf.Name("/Transparency"),
-                    CS=pikepdf.Name("/DeviceRGB")
-                )
-            else:
-                if "/CS" not in page.Group:
-                    page.Group.CS = pikepdf.Name("/DeviceRGB")
-                    
-            if "/Resources" not in page:
-                page.Resources = pikepdf.Dictionary()
-            if "/ColorSpace" not in page.Resources:
-                page.Resources.ColorSpace = pikepdf.Dictionary()
-                
-            if "/DefaultRGB" not in page.Resources.ColorSpace:
-                page.Resources.ColorSpace.DefaultRGB = cal_rgb
-        
-        if level == "3b" and attachments:
-            if "/AF" not in pdf.Root:
-                pdf.Root.AF = pikepdf.Array()
-                
-            if "/Names" not in pdf.Root:
-                pdf.Root.Names = pikepdf.Dictionary()
-                
-            if "/EmbeddedFiles" not in pdf.Root.Names:
-                pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
-                
-            for name, file_data in attachments:
-                ef_stream = pdf.make_stream(file_data)
-                ef_stream.Type = pikepdf.Name("/EmbeddedFile")
-                ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
-                
-                filespec_dict = pikepdf.Dictionary(
-                    Type=pikepdf.Name("/Filespec"),
-                    F=name,
-                    UF=name,
-                    EF=pikepdf.Dictionary(F=ef_stream, UF=ef_stream),
-                    AFRelationship=pikepdf.Name("/Unspecified")
-                )
-                
-                filespec_obj = pdf.make_indirect(filespec_dict)
-                
-                pdf.Root.Names.EmbeddedFiles.Names.append(name)
-                pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
-                pdf.Root.AF.append(filespec_obj)
-                
-        xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
-<x:xmpmeta xmlns:x="adobe:ns:meta/">
-  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
-    <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
-      <pdfaid:part>{part}</pdfaid:part>
-      <pdfaid:conformance>{conformance}</pdfaid:conformance>
-    </rdf:Description>
-  </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end="w"?>"""
-        
-        meta_stream = pdf.make_stream(xml_metadata.encode('utf-8'))
-        meta_stream.Type = pikepdf.Name("/Metadata")
-        meta_stream.Subtype = pikepdf.Name("/XML")
-        pdf.Root.Metadata = meta_stream
-        
-        pdf.save(temp_out_path)
-        pdf.close()
-        
-        with open(temp_out_path, "rb") as f:
-            pdfa_bytes = f.read()
-            
-        return pdfa_bytes
-        
-    except Exception as e:
-        st.error(f"Error: {str(e)}")
-        return None
-    finally:
-        if os.path.exists(temp_in_path): os.remove(temp_in_path)
-        if os.path.exists(temp_out_path): os.remove(temp_out_path)
+    return None
 
 def get_file_hash(file_bytes):
     return hashlib.sha256(file_bytes).hexdigest()
@@ -304,6 +98,233 @@ def get_attachments_info(pdf_bytes):
         pass
     return list(set(names))
 
+# ==========================================
+# FUNCIONES PRINCIPALES
+# ==========================================
+
+def convert_word_to_pdfa_native(docx_bytes, original_filename):
+    if not WIN32_AVAILABLE:
+        st.error("La librería pywin32 no está instalada. Ejecuta: pip install pywin32")
+        return None
+
+    pythoncom.CoInitialize()
+    word = None
+    doc = None
+    docx_path = ""
+    pdf_path = ""
+    
+    try:
+        fd_docx, docx_path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd_docx) 
+        
+        fd_pdf, pdf_path = tempfile.mkstemp(suffix=".pdf")
+        os.close(fd_pdf) 
+        
+        with open(docx_path, "wb") as f:
+            f.write(docx_bytes)
+            
+        word = win32com.client.DispatchEx("Word.Application")
+        word.Visible = False
+        word.DisplayAlerts = 0  
+        word.AutomationSecurity = 3  
+        
+        doc = word.Documents.Open(
+            FileName=docx_path, 
+            ConfirmConversions=False, 
+            ReadOnly=False, 
+            AddToRecentFiles=False, 
+            Visible=False
+        )
+        
+        doc.ExportAsFixedFormat(
+            OutputFileName=pdf_path,
+            ExportFormat=17, 
+            OpenAfterExport=False,
+            OptimizeFor=0, 
+            Range=0, 
+            From=1,
+            To=1,
+            Item=0, 
+            IncludeDocProps=True,
+            KeepIRM=True,
+            CreateBookmarks=1, 
+            DocStructureTags=True,
+            BitmapMissingFonts=True,
+            UseISO19005_1=True 
+        )
+        
+        doc.Close(False) 
+        word.Quit(False)
+        
+        with open(pdf_path, "rb") as f:
+            pdf_bytes = f.read()
+            
+        return pdf_bytes
+        
+    except Exception as e:
+        st.error(f"Error en el puente con Microsoft Word: {str(e)}")
+        return None
+    finally:
+        try:
+            if doc: doc.Close(False)
+            if word: word.Quit(False)
+        except:
+            pass
+        pythoncom.CoUninitialize()
+        
+        if os.path.exists(docx_path): 
+            try: os.remove(docx_path) 
+            except: pass
+        if os.path.exists(pdf_path): 
+            try: os.remove(pdf_path) 
+            except: pass
+
+def embed_file_in_pdf(pdf_bytes, attachment_bytes, attachment_name):
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    doc.embfile_add(attachment_name, attachment_bytes, filename=attachment_name, ufilename=attachment_name)
+    return doc.write()
+
+def convert_to_pdfa(pdf_bytes, level="3b"):
+    gs_cmd = "gswin64c" if os.name == "nt" else "gs"
+    part = "3" if level == "3b" else "2"
+    conformance = "B"
+    
+    attachments = []
+    try:
+        doc_original = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        for name in doc_original.embfile_names():
+            attachments.append((name, doc_original.embfile_get(name)))
+            
+        for name in doc_original.embfile_names():
+            doc_original.embfile_del(name)
+            
+        pdf_bytes = doc_original.write(garbage=4)
+        doc_original.close()
+    except Exception:
+        pass
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_in:
+        temp_in.write(pdf_bytes)
+        temp_in_path = temp_in.name
+        
+    temp_out_path = temp_in_path.replace(".pdf", "_out.pdf")
+    
+    try:
+        cmd = [
+            gs_cmd,
+            "-dPDFA=" + part,
+            "-dBATCH",
+            "-dNOPAUSE",
+            "-sColorConversionStrategy=RGB",
+            "-sDEVICE=pdfwrite",
+            f"-sOutputFile={temp_out_path}",
+            temp_in_path
+        ]
+        
+        process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if process.returncode != 0:
+            st.error(f"Fallo en Ghostscript: {process.stderr}")
+            return None
+            
+        pdf = pikepdf.Pdf.open(temp_out_path, allow_overwriting_input=True)
+        
+        cal_rgb = pikepdf.Array([
+            pikepdf.Name("/CalRGB"),
+            pikepdf.Dictionary(
+                WhitePoint=pikepdf.Array([0.9505, 1.0000, 1.0890]),
+                Gamma=pikepdf.Array([2.2, 2.2, 2.2]),
+                Matrix=pikepdf.Array([0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505])
+            )
+        ])
+        
+        cal_gray = pikepdf.Array([
+            pikepdf.Name("/CalGray"),
+            pikepdf.Dictionary(
+                WhitePoint=pikepdf.Array([0.9505, 1.0000, 1.0890]),
+                Gamma=2.2
+            )
+        ])
+        
+        for page in pdf.pages:
+            if "/Group" not in page:
+                page.Group = pikepdf.Dictionary(
+                    S=pikepdf.Name("/Transparency"),
+                    CS=pikepdf.Name("/DeviceRGB")
+                )
+            else:
+                if "/CS" not in page.Group:
+                    page.Group.CS = pikepdf.Name("/DeviceRGB")
+                    
+            if "/Resources" not in page:
+                page.Resources = pikepdf.Dictionary()
+            if "/ColorSpace" not in page.Resources:
+                page.Resources.ColorSpace = pikepdf.Dictionary()
+                
+            if "/DefaultRGB" not in page.Resources.ColorSpace:
+                page.Resources.ColorSpace.DefaultRGB = cal_rgb
+            if "/DefaultGray" not in page.Resources.ColorSpace:
+                page.Resources.ColorSpace.DefaultGray = cal_gray
+        
+        if level == "3b" and attachments:
+            if "/AF" not in pdf.Root:
+                pdf.Root.AF = pikepdf.Array()
+                
+            if "/Names" not in pdf.Root:
+                pdf.Root.Names = pikepdf.Dictionary()
+                
+            if "/EmbeddedFiles" not in pdf.Root.Names:
+                pdf.Root.Names.EmbeddedFiles = pikepdf.Dictionary(Names=pikepdf.Array())
+                
+            for name, file_data in attachments:
+                ef_stream = pdf.make_stream(file_data)
+                ef_stream.Type = pikepdf.Name("/EmbeddedFile")
+                ef_stream.Subtype = pikepdf.Name("/application/octet-stream")
+                
+                filespec_dict = pikepdf.Dictionary(
+                    Type=pikepdf.Name("/Filespec"),
+                    F=name,
+                    UF=name,
+                    EF=pikepdf.Dictionary(F=ef_stream, UF=ef_stream),
+                    AFRelationship=pikepdf.Name("/Unspecified")
+                )
+                
+                filespec_obj = pdf.make_indirect(filespec_dict)
+                
+                pdf.Root.Names.EmbeddedFiles.Names.append(name)
+                pdf.Root.Names.EmbeddedFiles.Names.append(filespec_obj)
+                pdf.Root.AF.append(filespec_obj)
+                
+        xml_metadata = f"""<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">
+      <pdfaid:part>{part}</pdfaid:part>
+      <pdfaid:conformance>{conformance}</pdfaid:conformance>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"""
+        
+        meta_stream = pdf.make_stream(xml_metadata.encode('utf-8'))
+        meta_stream.Type = pikepdf.Name("/Metadata")
+        meta_stream.Subtype = pikepdf.Name("/XML")
+        pdf.Root.Metadata = meta_stream
+        
+        pdf.save(temp_out_path)
+        pdf.close()
+        
+        with open(temp_out_path, "rb") as f:
+            pdfa_bytes = f.read()
+            
+        return pdfa_bytes
+        
+    except Exception as e:
+        st.error(f"Error: {str(e)}")
+        return None
+    finally:
+        if os.path.exists(temp_in_path): os.remove(temp_in_path)
+        if os.path.exists(temp_out_path): os.remove(temp_out_path)
+
 def generate_report(file_name, file_bytes):
     sha256_hash = get_file_hash(file_bytes)
     size_kb = len(file_bytes) / 1024
@@ -355,7 +376,7 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
                 total_pages = len(doc)
                 metadata = doc.metadata
                 raw_creation_date = metadata.get('creationDate', '')
-                creation_date = parse_pdf_date(raw_creation_date)
+                creation_date = parse_pdf_date(raw_creation_date).strftime("%Y-%m-%d %H:%M:%S") if parse_pdf_date(raw_creation_date) else "Desconocida"
                 doc.close()
             except Exception:
                 pass
@@ -411,11 +432,100 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         
     return pd.DataFrame(index_data)
 
+def generate_fuid_inventory(parent_folder_path):
+    """Genera el Formato Único de Inventario Documental (FUID) basado en la estructura de carpetas"""
+    parent_path = Path(parent_folder_path)
+    if not parent_path.exists() or not parent_path.is_dir():
+        return None, "La ruta especificada no es una carpeta válida."
+    
+    folder_name = parent_path.name
+    
+    # Intentar extraer Código y Serie/Subserie del nombre de la carpeta (Ej: "100-20 Actas de Comité")
+    match = re.match(r"^([\w\-\.]+)\s+(.*)$", folder_name)
+    if match:
+        codigo_serie = match.group(1)
+        nombre_serie = match.group(2)
+    else:
+        codigo_serie = "S.C."
+        nombre_serie = folder_name
+
+    inventory_rows = []
+    
+    # Listar subcarpetas (Unidades Documentales / Expedientes)
+    subfolders = [f for f in parent_path.iterdir() if f.is_dir()]
+    if not subfolders:
+        # Si no hay subcarpetas, la misma carpeta principal actúa como unidad
+        subfolders = [parent_path]
+
+    for idx, subfolder in enumerate(subfolders, start=1):
+        unidad_documental = subfolder.name
+        ubicacion_ruta = str(subfolder.resolve())
+        
+        # Recopilar archivos dentro de la subcarpeta
+        files = [f for f in subfolder.glob("**/*") if f.is_file() and not f.name.startswith(".")]
+        cantidad_docs = len(files)
+        
+        # Calcular tamaño total de la subcarpeta en MB
+        total_size_bytes = sum(f.stat().st_size for f in files)
+        tamano_mb = f"{total_size_bytes / (1024 * 1024):.2f} MB"
+        
+        # Calcular fechas extremas analizando metadatos PDF internos
+        fechas = []
+        for file in files:
+            if file.suffix.lower() == ".pdf":
+                try:
+                    doc = pymupdf.open(str(file))
+                    raw_date = doc.metadata.get('creationDate', '')
+                    dt = parse_pdf_date(raw_date)
+                    if dt:
+                        fechas.append(dt)
+                    doc.close()
+                except:
+                    pass
+            # Respaldar con fecha de modificación del sistema si no hay PDF o metadatos
+            try:
+                m_time = datetime.fromtimestamp(file.stat().st_mtime)
+                fechas.append(m_time)
+            except:
+                pass
+                
+        if fechas:
+            fecha_inicial = min(fechas).strftime("%Y-%m-%d")
+            fecha_final = max(fechas).strftime("%Y-%m-%d")
+        else:
+            fecha_inicial = "S.F."
+            fecha_final = "S.F."
+
+        # Estructura exacta del FUID (Acuerdo 001 de 2024 - Anexo 3)
+        row = {
+            "NÚMERO DE ORDEN": idx,
+            "CÓDIGO": codigo_serie,
+            "NOMBRE DE LA SERIE, SUBSERIE O ASUNTO": nombre_serie,
+            "NOMBRE DE LA UNIDAD DOCUMENTAL": unidad_documental,
+            "FECHAS EXTREMAS - Inicial": fecha_inicial,
+            "FECHAS EXTREMAS - Final": fecha_final,
+            "SOPORTE - Electrónico": "X",
+            "SOPORTE - Físico": "",
+            "FÍSICO - Caja": "N/A",
+            "FÍSICO - Carpeta": "N/A",
+            "FÍSICO - Tomo/legajo/libro": "N/A",
+            "FÍSICO - Número de folios": "N/A",
+            "FÍSICO - Otro Tipo": "N/A",
+            "FÍSICO - Otro Cantidad": "N/A",
+            "ELECTRÓNICO - Ubicación": ubicacion_ruta,
+            "ELECTRÓNICO - Cantidad de documentos": cantidad_docs,
+            "ELECTRÓNICO - Tamaño": tamano_mb,
+            "NOTAS": "Generado automáticamente por SGDEA INS"
+        }
+        inventory_rows.append(row)
+        
+    return pd.DataFrame(inventory_rows), None
+
 # ==========================================
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v19.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v20.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -444,21 +554,21 @@ with col_menu:
             )
         )
     else:
-        st.markdown("#### Creación de Índices")
+        st.markdown("#### Procesamiento por Lotes")
         menu_option = st.radio(
-            "Origen de los archivos:",
+            "Acción de lote:",
             (
-                "1. Subir archivos manualmente",
-                "2. Conectar a Aurora Nextcloud"
+                "1. Generar Índice Electrónico (Manual)",
+                "2. Conectar a Aurora Nextcloud",
+                "3. Inventario Documental (FUID - AGN)"
             )
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v19.0)")
+    st.title("📄 Herramienta de Preservación Documental (v20.0)")
     
     if modulo == "📄 Documentos Individuales":
         
-        # Flujo exclusivo para Transformación Word
         if "7. Transformar Word" in menu_option:
             st.subheader("📝 Exportación Nativa de Word a PDF/A")
             st.write("Genera un documento PDF preservado utilizando el motor original de Microsoft Word.")
@@ -479,7 +589,6 @@ with col_main:
                             mime="application/pdf"
                         )
         
-        # Flujo estándar para PDFs
         else:
             main_pdf = st.file_uploader("Sube el archivo PDF principal", type=["pdf"])
             
@@ -534,7 +643,6 @@ with col_main:
 
                             st.markdown("---")
                             st.markdown("### 🏷️ 2. Diccionario de Información (`/Info`)")
-                            st.write("Metadatos tradicionales y campos ocultos inyectados por el software creador.")
                             info_dict = {}
                             if hasattr(pdf_pike, 'docinfo'):
                                 for key, value in pdf_pike.docinfo.items():
@@ -547,15 +655,14 @@ with col_main:
 
                             st.markdown("---")
                             st.markdown("### 🏗️ 3. Estructura del Catálogo Maestro (`/Root`)")
-                            st.write("El 'cerebro' del documento. Revela formularios (`/AcroForm`), esquemas de color (`/OutputIntents`) y firmas digitales.")
                             root_dict = {}
                             for key, value in pdf_pike.Root.items():
                                 if str(key) == "/Pages":
-                                    root_dict[str(key)] = f"[Árbol de Páginas Oculto para evitar saturación: {len(pdf_pike.pages)} páginas]"
+                                    root_dict[str(key)] = f"[Árbol de Páginas Oculto: {len(pdf_pike.pages)} páginas]"
                                 else:
                                     val_str = str(value)
                                     if len(val_str) > 200:
-                                        val_str = val_str[:200] + "... [Contenido truncado]"
+                                        val_str = val_str[:200] + "... [Truncado]"
                                     root_dict[str(key)] = val_str
                             st.json(root_dict)
 
@@ -574,7 +681,6 @@ with col_main:
 
                             st.markdown("---")
                             st.markdown("### 🧩 5. Capa XMP Completa (XML Crudo)")
-                            st.write("Aquí residen las firmas PDF/A y los esquemas de preservación extensibles.")
                             xmp_meta = doc.get_xml_metadata()
                             if xmp_meta:
                                 with st.expander("Ver estructura XML completa", expanded=True):
@@ -586,9 +692,9 @@ with col_main:
                             pdf_pike.close()
 
     else:
-        st.subheader("📁 Índice Electrónico de Expedientes Multiformato")
+        st.subheader("📁 Procesamiento por Lotes y Gestión Archivística")
         
-        if "Subir archivos" in menu_option:
+        if "1. Generar Índice" in menu_option:
             st.write("Selecciona o arrastra múltiples archivos de cualquier formato desde tu equipo.")
             origen_opcion = st.selectbox("Origen predeterminado:", ["Digitalizado", "Electrónico", "Físico"], key="orig_manual")
             batch_files = st.file_uploader("Sube los archivos del expediente", accept_multiple_files=True)
@@ -624,7 +730,7 @@ with col_main:
                                 mime="application/xml"
                             )
                         
-        elif "Aurora Nextcloud" in menu_option:
+        elif "2. Conectar a Aurora Nextcloud" in menu_option:
             st.write("Conéctate al repositorio en la nube para indexar el expediente (incluye todos los formatos).")
             
             col1, col2 = st.columns(2)
@@ -689,3 +795,36 @@ with col_main:
                         except Exception as e:
                             st.error(f"❌ Error de conexión o lectura: {str(e)}")
                             st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta exista.")
+
+        elif "3. Inventario Documental (FUID - AGN)" in menu_option:
+            st.subheader("📋 Generador del Formato Único de Inventario Documental (FUID)")
+            st.write("Genera el inventario archivístico oficial acorde al Acuerdo 001 de 2024 (Anexo 3) del Archivo General de la Nación[cite: 13, 14, 18].")
+            
+            folder_path_input = st.text_input(
+                "Ruta absoluta de la carpeta contenedora en tu equipo:",
+                placeholder=r"C:\Users\Usuario\Documents\Expedientes\100-20 Actas de Comité"
+            )
+            
+            if st.button("Generar FUID Institucional"):
+                if not folder_path_input:
+                    st.warning("⚠️ Por favor, ingresa la ruta de la carpeta.")
+                else:
+                    with st.spinner("Analizando subcarpetas, calculando pesos y extrayendo fechas extremas de los metadatos..."):
+                        df_fuid, err = generate_fuid_inventory(folder_path_input)
+                        
+                        if err:
+                            st.error(f"❌ {err}")
+                        else:
+                            st.success("¡Inventario FUID generado exitosamente!")
+                            st.dataframe(df_fuid)
+                            
+                            output_fuid_excel = BytesIO()
+                            with pd.ExcelWriter(output_fuid_excel, engine='openpyxl') as writer:
+                                df_fuid.to_excel(writer, index=False, sheet_name='FUID_Inventario')
+                                
+                            st.download_button(
+                                label="📥 Descargar FUID Oficial (.xlsx)",
+                                data=output_fuid_excel.getvalue(),
+                                file_name="Inventario_FUID_AGN.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                            )
