@@ -12,6 +12,7 @@ from datetime import datetime
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import psycopg2
 
 # Librerías para comunicación nativa con Microsoft Word en Windows
 try:
@@ -22,7 +23,86 @@ except ImportError:
     WIN32_AVAILABLE = False
 
 # ==========================================
-# FUNCIONES AUXILIARES
+# GESTIÓN DE BASE DE DATOS (NEON.TECH)
+# ==========================================
+
+def init_neon_db(neon_conn_str):
+    """Inicializa la tabla en Neon.tech si no existe"""
+    try:
+        conn = psycopg2.connect(neon_conn_str)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS historial_inventarios (
+                id SERIAL PRIMARY KEY,
+                fecha_generacion TIMESTAMP,
+                tipo_proceso VARCHAR(50),
+                serie_subserie TEXT,
+                codigo VARCHAR(50),
+                unidad_documental TEXT,
+                fecha_inicial VARCHAR(20),
+                fecha_final VARCHAR(20),
+                cantidad_documentos INT,
+                tamano_total VARCHAR(50),
+                ubicacion TEXT,
+                usuario_sistema VARCHAR(100)
+            )
+        ''')
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error conectando a Neon.tech: {str(e)}")
+        return False
+
+def guardar_en_neon(neon_conn_str, df_data, tipo_proceso):
+    """Guarda los registros generados directamente en Neon.tech"""
+    try:
+        conn = psycopg2.connect(neon_conn_str)
+        cursor = conn.cursor()
+        fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        for _, row in df_data.iterrows():
+            if tipo_proceso == "FUID":
+                serie = row.get("NOMBRE DE LA SERIE, SUBSERIE O ASUNTO", "N/A")
+                codigo = row.get("CÓDIGO", "N/A")
+                unidad = row.get("NOMBRE DE LA UNIDAD DOCUMENTAL", "N/A")
+                f_ini = row.get("FECHAS EXTREMAS - Inicial", "S.F.")
+                f_fin = row.get("FECHAS EXTREMAS - Final", "S.F.")
+                cant = row.get("ELECTRÓNICO - Cantidad de documentos", 0)
+                tam = row.get("ELECTRÓNICO - Tamaño", "0 MB")
+                ubi = row.get("ELECTRÓNICO - Ubicación", "N/A")
+            else:  # Índice Electrónico
+                serie = "Índice Multiformato"
+                codigo = "IND"
+                unidad = row.get("Nombre_Documento", "N/A")
+                f_ini = row.get("Fecha_Creacion_Documento", "S.F.")
+                f_fin = f_ini
+                cant = 1
+                tam = row.get("Tamano", "0 KB")
+                ubi = row.get("Origen", "N/A")
+
+            cursor.execute('''
+                INSERT INTO historial_inventarios (
+                    fecha_generacion, tipo_proceso, serie_subserie, codigo, 
+                    unidad_documental, fecha_inicial, fecha_final, 
+                    cantidad_documentos, tamano_total, ubicacion, usuario_sistema
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ''', (
+                fecha_actual, tipo_proceso, serie, codigo, 
+                unidad, f_ini, f_fin, int(cant), tam, ubi, "Usuario INS"
+            ))
+            
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        st.error(f"Error al insertar en Neon.tech: {str(e)}")
+        return False
+
+# ==========================================
+# FUNCIONES AUXILIARES Y PRINCIPALES
 # ==========================================
 
 def parse_pdf_date(date_str):
@@ -97,10 +177,6 @@ def get_attachments_info(pdf_bytes):
     except Exception:
         pass
     return list(set(names))
-
-# ==========================================
-# FUNCIONES PRINCIPALES
-# ==========================================
 
 def convert_word_to_pdfa_native(docx_bytes, original_filename):
     if not WIN32_AVAILABLE:
@@ -433,11 +509,9 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
     return pd.DataFrame(index_data)
 
 def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
-    """Genera el Formato Único de Inventario Documental (FUID) conectándose a Nextcloud"""
+    """Genera el FUID conectándose a Nextcloud"""
     try:
         nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
-        
-        # 1. Obtener nodos de la carpeta principal
         nodos_principales = nc.files.listdir(nc_folder)
         folder_name = nc_folder.strip("/").split("/")[-1]
         
@@ -450,20 +524,15 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
             nombre_serie = folder_name
 
         inventory_rows = []
-        
-        # Filtrar subcarpetas (Unidades Documentales)
         subcarpetas = [n for n in nodos_principales if n.is_dir]
         if not subcarpetas:
-            return None, "No se encontraron subcarpetas (unidades documentales) en la ruta de Nextcloud especificada."
+            return None, "No se encontraron subcarpetas en la ruta de Nextcloud especificada."
 
         for idx, sub_node in enumerate(subcarpetas, start=1):
             unidad_documental = sub_node.name
-            
-            # Construir la ruta de la subcarpeta de manera segura utilizando su nombre
             sub_folder_path = f"{nc_folder.rstrip('/')}/{unidad_documental}"
             ubicacion_ruta = f"{nc_url}/index.php/apps/files/?dir={sub_folder_path}"
             
-            # Listar contenido de la subcarpeta usando la ruta construida
             try:
                 nodos_internos = nc.files.listdir(sub_folder_path)
             except:
@@ -481,7 +550,6 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
                 except:
                     pass
                 
-                # Descargar en memoria para leer metadatos de fechas si es PDF
                 if file_node.name.lower().endswith(".pdf"):
                     try:
                         file_bytes = nc.files.download(file_node)
@@ -494,7 +562,6 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
                     except:
                         pass
                 
-                # Respaldar con fecha de modificación de Nextcloud si existe
                 try:
                     if hasattr(file_node, 'mtime') and file_node.mtime:
                         fechas.append(datetime.fromtimestamp(file_node.mtime))
@@ -535,11 +602,21 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
         return pd.DataFrame(inventory_rows), None
     except Exception as e:
         return None, f"Error conectando a Nextcloud: {str(e)}"
+
 # ==========================================
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v21.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v23.0 - Neon.tech", layout="wide")
+
+# Barra lateral de configuración de base de datos Neon.tech
+st.sidebar.markdown("### 🔌 Conexión Neon.tech")
+neon_url_input = st.sidebar.text_input(
+    "Connection String (PostgreSQL):", 
+    type="password", 
+    placeholder="postgres://user:password@host/dbname?sslmode=require",
+    value=os.getenv("NEON_CONN_STRING", "")
+)
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -548,7 +625,7 @@ with col_menu:
     
     modulo = st.selectbox(
         "Selecciona el módulo de trabajo:",
-        ["📄 Documentos Individuales", "📁 Procesamiento por Lotes"]
+        ["📄 Documentos Individuales", "📁 Procesamiento por Lotes", "🗄️ Historial Neon.tech"]
     )
     
     st.markdown("---")
@@ -567,7 +644,7 @@ with col_menu:
                 "7. Transformar Word a PDF/A nativo"
             )
         )
-    else:
+    elif modulo == "📁 Procesamiento por Lotes":
         st.markdown("#### Procesamiento por Lotes")
         menu_option = st.radio(
             "Acción de lote:",
@@ -577,9 +654,12 @@ with col_menu:
                 "3. Inventario Documental (FUID - AGN)"
             )
         )
+    else:
+        st.markdown("#### Auditoría Cloud")
+        menu_option = "1. Consultar Base de Datos Neon"
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v21.0)")
+    st.title("📄 Herramienta de Preservación Documental (v23.0 - Neon.tech)")
     
     if modulo == "📄 Documentos Individuales":
         
@@ -705,7 +785,7 @@ with col_main:
                             doc.close()
                             pdf_pike.close()
 
-    else:
+    elif modulo == "📁 Procesamiento por Lotes":
         st.subheader("📁 Procesamiento por Lotes y Gestión Archivística")
         
         if "1. Generar Índice" in menu_option:
@@ -715,38 +795,31 @@ with col_main:
             
             if batch_files:
                 st.info(f"Se han cargado {len(batch_files)} archivos para procesar.")
-                if st.button("Generar Índice"):
-                    with st.spinner("Procesando lote, ordenando por fecha y extrayendo metadatos..."):
-                        df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
-                        st.dataframe(df_index)
-                        
-                        output_excel = BytesIO()
-                        with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                            df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
-                        
-                        xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
-                        
-                        st.success("¡Índices electrónicos generados con éxito!")
-                        
-                        col_btn1, col_btn2 = st.columns(2)
-                        with col_btn1:
-                            st.download_button(
-                                label="📥 Descargar Índice (.xlsx)",
-                                data=output_excel.getvalue(),
-                                file_name="indice_electronico_multiformato.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
-                        with col_btn2:
-                            st.download_button(
-                                label="📥 Descargar Índice (.xml)",
-                                data=xml_data.encode('utf-8'),
-                                file_name="indice_electronico_multiformato.xml",
-                                mime="application/xml"
-                            )
+                if st.button("Generar Índice y Guardar en Neon.tech"):
+                    if not neon_url_input:
+                        st.warning("⚠️ Ingresa la Connection String de Neon.tech en la barra lateral.")
+                    else:
+                        with st.spinner("Procesando lote, registrando en Neon.tech..."):
+                            df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
+                            if init_neon_db(neon_url_input):
+                                guardar_en_neon(neon_url_input, df_index, "INDICE")
+                                st.dataframe(df_index)
+                                
+                                output_excel = BytesIO()
+                                with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                                    df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
+                                
+                                xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
+                                st.success("¡Índices electrónicos guardados en Neon.tech y generados con éxito!")
+                                
+                                col_btn1, col_btn2 = st.columns(2)
+                                with col_btn1:
+                                    st.download_button("📥 Descargar Índice (.xlsx)", output_excel.getvalue(), file_name="indice_electronico_multiformato.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                                with col_btn2:
+                                    st.download_button("📥 Descargar Índice (.xml)", xml_data.encode('utf-8'), file_name="indice_electronico_multiformato.xml", mime="application/xml")
                         
         elif "2. Conectar a Aurora Nextcloud" in menu_option:
-            st.write("Conéctate al repositorio en la nube para indexar el expediente (incluye todos los formatos).")
-            
+            st.write("Conéctate al repositorio en la nube para indexar el expediente.")
             col1, col2 = st.columns(2)
             with col1:
                 nc_url = st.text_input("URL del Servidor", value="https://cloud.insdeportescajica.gov.co")
@@ -758,21 +831,18 @@ with col_main:
             origen_opcion = st.selectbox("Origen predeterminado:", ["Electrónico", "Digitalizado", "Físico"], key="orig_cloud")
             
             if st.button("Conectar y Generar Índice"):
-                if not all([nc_url, nc_user, nc_pass, nc_folder]):
-                    st.warning("⚠️ Por favor, completa todos los campos de conexión.")
+                if not all([nc_url, nc_user, nc_pass, nc_folder, neon_url_input]):
+                    st.warning("⚠️ Por favor, completa todos los campos de conexión incluyendo Neon.tech en la barra lateral.")
                 else:
-                    with st.spinner("Conectando con Aurora Nextcloud..."):
+                    with st.spinner("Conectando con Aurora Nextcloud y Neon.tech..."):
                         try:
                             nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
                             nodos = nc.files.listdir(nc_folder)
-                            
                             archivos_lote = [nodo for nodo in nodos if not nodo.is_dir]
                             
                             if not archivos_lote:
                                 st.error("No se encontraron archivos en la ruta especificada.")
                             else:
-                                st.info(f"✅ Conexión exitosa. Extrayendo metadatos de {len(archivos_lote)} documentos...")
-                                
                                 batch_files = []
                                 for node in archivos_lote:
                                     contenido_bytes = nc.files.download(node)
@@ -781,38 +851,28 @@ with col_main:
                                     batch_files.append(archivo_en_memoria)
                                 
                                 df_index = generate_electronic_index(batch_files, origen_default=origen_opcion)
-                                st.dataframe(df_index)
-                                
-                                output_excel = BytesIO()
-                                with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                                    df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
-                                
-                                xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
-                                
-                                st.success("¡Índices electrónicos generados con éxito desde Aurora Nextcloud!")
-                                
-                                col_btn1, col_btn2 = st.columns(2)
-                                with col_btn1:
-                                    st.download_button(
-                                        label="📥 Descargar Índice (.xlsx)",
-                                        data=output_excel.getvalue(),
-                                        file_name="indice_aurora_nextcloud.xlsx",
-                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                    )
-                                with col_btn2:
-                                    st.download_button(
-                                        label="📥 Descargar Índice (.xml)",
-                                        data=xml_data.encode('utf-8'),
-                                        file_name="indice_aurora_nextcloud.xml",
-                                        mime="application/xml"
-                                    )
+                                if init_neon_db(neon_url_input):
+                                    guardar_en_neon(neon_url_input, df_index, "INDICE")
+                                    st.dataframe(df_index)
+                                    
+                                    output_excel = BytesIO()
+                                    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                                        df_index.to_excel(writer, index=False, sheet_name='Indice_Electronico')
+                                    
+                                    xml_data = df_index.to_xml(index=False, root_name="Expediente", row_name="Documento", parser="etree")
+                                    st.success("¡Registrados en Neon.tech e índices generados desde Nextcloud con éxito!")
+                                    
+                                    col_btn1, col_btn2 = st.columns(2)
+                                    with col_btn1:
+                                        st.download_button("📥 Descargar Índice (.xlsx)", output_excel.getvalue(), file_name="indice_aurora_nextcloud.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                                    with col_btn2:
+                                        st.download_button("📥 Descargar Índice (.xml)", xml_data.encode('utf-8'), file_name="indice_aurora_nextcloud.xml", mime="application/xml")
                         except Exception as e:
-                            st.error(f"❌ Error de conexión o lectura: {str(e)}")
-                            st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta exista.")
+                            st.error(f"❌ Error: {str(e)}")
 
         elif "3. Inventario Documental (FUID - AGN)" in menu_option:
             st.subheader("📋 Inventario Documental (FUID) vía Aurora Nextcloud")
-            st.write("Conéctate a la nube institucional para generar el Formato Único de Inventario Documental (Acuerdo 001 de 2024 - Anexo 3) recorriendo automáticamente las subcarpetas[cite: 13, 14, 18].")
+            st.write("Genera el FUID y almacénalo centralizadamente en tu base de datos de Neon.tech.")
             
             col1, col2 = st.columns(2)
             with col1:
@@ -822,26 +882,59 @@ with col_main:
                 nc_pass_fuid = st.text_input("Contraseña de Aplicación", type="password", key="fuid_pass")
                 nc_folder_fuid = st.text_input("Ruta de la carpeta serie/subserie", placeholder="/Archivo Central/2021/100 DIRECCION/100.2 ACTAS", key="fuid_folder")
                 
-            if st.button("Conectar y Generar FUID Institucional"):
-                if not all([nc_url_fuid, nc_user_fuid, nc_pass_fuid, nc_folder_fuid]):
-                    st.warning("⚠️ Por favor, completa todos los campos de conexión.")
+            if st.button("Generar y Guardar FUID en Neon.tech"):
+                if not all([nc_url_fuid, nc_user_fuid, nc_pass_fuid, nc_folder_fuid, neon_url_input]):
+                    st.warning("⚠️ Por favor, completa todos los campos de conexión incluyendo Neon.tech en la barra lateral.")
                 else:
-                    with st.spinner("Conectando con Aurora Nextcloud, analizando subcarpetas y leyendo metadatos de PDFs..."):
+                    with st.spinner("Procesando FUID con Nextcloud y guardando en Neon.tech..."):
                         df_fuid, err = generate_fuid_from_nextcloud(nc_url_fuid, nc_user_fuid, nc_pass_fuid, nc_folder_fuid)
                         
                         if err:
                             st.error(f"❌ {err}")
                         else:
-                            st.success("¡Inventario FUID generado exitosamente desde Aurora Nextcloud!")
-                            st.dataframe(df_fuid)
-                            
-                            output_fuid_excel = BytesIO()
-                            with pd.ExcelWriter(output_fuid_excel, engine='openpyxl') as writer:
-                                df_fuid.to_excel(writer, index=False, sheet_name='FUID_Inventario')
+                            if init_neon_db(neon_url_input):
+                                guardar_en_neon(neon_url_input, df_fuid, "FUID")
+                                st.success("¡Inventario FUID generado y registrado en Neon.tech exitosamente!")
+                                st.dataframe(df_fuid)
                                 
-                            st.download_button(
-                                label="📥 Descargar FUID Oficial (.xlsx)",
-                                data=output_fuid_excel.getvalue(),
-                                file_name="Inventario_FUID_Nextcloud.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                            )
+                                output_fuid_excel = BytesIO()
+                                with pd.ExcelWriter(output_fuid_excel, engine='openpyxl') as writer:
+                                    df_fuid.to_excel(writer, index=False, sheet_name='FUID_Inventario')
+                                    
+                                st.download_button(
+                                    label="📥 Descargar FUID Oficial (.xlsx)",
+                                    data=output_fuid_excel.getvalue(),
+                                    file_name="Inventario_FUID_Nextcloud.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                                )
+
+    else:
+        st.subheader("🗄️ Historial Cloud en Neon.tech")
+        st.write("Consulta el registro centralizado de todos los inventarios y expedientes procesados en la nube.")
+        
+        if not neon_url_input:
+            st.warning("⚠️ Ingresa tu Connection String de Neon.tech en el panel izquierdo para consultar los registros.")
+        else:
+            try:
+                conn = psycopg2.connect(neon_url_input)
+                df_historial = pd.read_sql_query("SELECT * FROM historial_inventarios ORDER BY id DESC", conn)
+                conn.close()
+                
+                if df_historial.empty:
+                    st.info("La tabla en Neon.tech está vacía. Genera un inventario FUID o un índice para comenzar.")
+                else:
+                    st.metric("Total de Registros en la Nube", len(df_historial))
+                    st.dataframe(df_historial, use_container_width=True)
+                    
+                    output_db = BytesIO()
+                    with pd.ExcelWriter(output_db, engine='openpyxl') as writer:
+                        df_historial.to_excel(writer, index=False, sheet_name='Historial_Neon')
+                        
+                    st.download_button(
+                        label="📥 Exportar Historial Cloud a Excel (.xlsx)",
+                        data=output_db.getvalue(),
+                        file_name="Historial_Neon_SGDEA_INS.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+            except Exception as e:
+                st.error(f"Error conectando a la base de datos de Neon.tech: {str(e)}")
