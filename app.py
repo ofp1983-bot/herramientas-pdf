@@ -432,109 +432,108 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
         
     return pd.DataFrame(index_data)
 
-def generate_fuid_inventory(parent_folder_path):
-    """Genera el Formato Único de Inventario Documental (FUID) basado en la estructura de carpetas"""
-    # Limpiar comillas accidentales si el usuario las copió al pegar la ruta
-    clean_path_str = parent_folder_path.strip('"').strip("'")
-    
-    parent_path = Path(clean_path_str)
-    
-    if not parent_path.exists():
-        return None, f"La ruta no existe en el disco: {clean_path_str}"
-    if not parent_path.is_dir():
-        return None, f"La ruta especificada corresponde a un archivo, no a una carpeta: {clean_path_str}"
-    
-    folder_name = parent_path.name
-    
-    # Intentar extraer Código y Serie/Subserie del nombre de la carpeta
-    match = re.match(r"^([\w\-\.]+)\s+(.*)$", folder_name)
-    if match:
-        codigo_serie = match.group(1)
-        nombre_serie = match.group(2)
-    else:
-        codigo_serie = "S.C."
-        nombre_serie = folder_name
-
-    inventory_rows = []
-    
-    # Listar subcarpetas (Unidades Documentales / Expedientes)
+def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
+    """Genera el Formato Único de Inventario Documental (FUID) conectándose a Nextcloud"""
     try:
-        subfolders = [f for f in parent_path.iterdir() if f.is_dir() and not f.name.startswith('.')]
-    except Exception as e:
-        return None, f"Error al leer los permisos de la carpeta: {str(e)}"
+        nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
         
-    if not subfolders:
-        # Si no hay subcarpetas, la misma carpeta principal actúa como unidad
-        subfolders = [parent_path]
+        # 1. Obtener nodos de la carpeta principal
+        nodos_principales = nc.files.listdir(nc_folder)
+        folder_name = nc_folder.strip("/").split("/")[-1]
+        
+        match = re.match(r"^([\w\-\.]+)\s+(.*)$", folder_name)
+        if match:
+            codigo_serie = match.group(1)
+            nombre_serie = match.group(2)
+        else:
+            codigo_serie = "S.C."
+            nombre_serie = folder_name
 
-    for idx, subfolder in enumerate(subfolders, start=1):
-        unidad_documental = subfolder.name
-        ubicacion_ruta = str(subfolder.resolve())
+        inventory_rows = []
         
-        # Recopilar archivos dentro de la subcarpeta
-        files = [f for f in subfolder.glob("**/*") if f.is_file() and not f.name.startswith(".")]
-        cantidad_docs = len(files)
-        
-        # Calcular tamaño total de la subcarpeta en MB
-        total_size_bytes = sum(f.stat().st_size for f in files)
-        tamano_mb = f"{total_size_bytes / (1024 * 1024):.2f} MB"
-        
-        # Calcular fechas extremas analizando metadatos PDF internos
-        fechas = []
-        for file in files:
-            if file.suffix.lower() == ".pdf":
+        # Filtrar subcarpetas (Unidades Documentales)
+        subcarpetas = [n for n in nodos_principales if n.is_dir]
+        if not subcarpetas:
+            return None, "No se encontraron subcarpetas (unidades documentales) en la ruta de Nextcloud especificada."
+
+        for idx, sub_node in enumerate(subcarpetas, start=1):
+            unidad_documental = sub_node.name
+            ubicacion_ruta = f"{nc_url}/index.php/apps/files/?dir={sub_node.path}"
+            
+            # Listar contenido de la subcarpeta
+            nodos_internos = nc.files.listdir(sub_node.path)
+            archivos_internos = [n for n in nodos_internos if not n.is_dir]
+            cantidad_docs = len(archivos_internos)
+            
+            total_size_bytes = 0
+            fechas = []
+            
+            for file_node in archivos_internos:
                 try:
-                    doc = pymupdf.open(str(file))
-                    raw_date = doc.metadata.get('creationDate', '')
-                    dt = parse_pdf_date(raw_date)
-                    if dt:
-                        fechas.append(dt)
-                    doc.close()
+                    total_size_bytes += file_node.size
                 except:
                     pass
-            try:
-                m_time = datetime.fromtimestamp(file.stat().st_mtime)
-                fechas.append(m_time)
-            except:
-                pass
                 
-        if fechas:
-            fecha_inicial = min(fechas).strftime("%Y-%m-%d")
-            fecha_final = max(fechas).strftime("%Y-%m-%d")
-        else:
-            fecha_inicial = "S.F."
-            fecha_final = "S.F."
+                # Descargar en memoria para leer metadatos de fechas si es PDF
+                if file_node.name.lower().endswith(".pdf"):
+                    try:
+                        file_bytes = nc.files.download(file_node)
+                        doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+                        raw_date = doc.metadata.get('creationDate', '')
+                        dt = parse_pdf_date(raw_date)
+                        if dt:
+                            fechas.append(dt)
+                        doc.close()
+                    except:
+                        pass
+                
+                # Respaldar con fecha de modificación de Nextcloud si existe
+                try:
+                    if hasattr(file_node, 'mtime') and file_node.mtime:
+                        fechas.append(datetime.fromtimestamp(file_node.mtime))
+                except:
+                    pass
 
-        # Estructura exacta del FUID (Acuerdo 001 de 2024 - Anexo 3)
-        row = {
-            "NÚMERO DE ORDEN": idx,
-            "CÓDIGO": codigo_serie,
-            "NOMBRE DE LA SERIE, SUBSERIE O ASUNTO": nombre_serie,
-            "NOMBRE DE LA UNIDAD DOCUMENTAL": unidad_documental,
-            "FECHAS EXTREMAS - Inicial": fecha_inicial,
-            "FECHAS EXTREMAS - Final": fecha_final,
-            "SOPORTE - Electrónico": "X",
-            "SOPORTE - Físico": "",
-            "FÍSICO - Caja": "N/A",
-            "FÍSICO - Carpeta": "N/A",
-            "FÍSICO - Tomo/legajo/libro": "N/A",
-            "FÍSICO - Número de folios": "N/A",
-            "FÍSICO - Otro Tipo": "N/A",
-            "FÍSICO - Otro Cantidad": "N/A",
-            "ELECTRÓNICO - Ubicación": ubicacion_ruta,
-            "ELECTRÓNICO - Cantidad de documentos": cantidad_docs,
-            "ELECTRÓNICO - Tamaño": tamano_mb,
-            "NOTAS": "Generado automáticamente por SGDEA INS"
-        }
-        inventory_rows.append(row)
-        
-    return pd.DataFrame(inventory_rows), None
+            tamano_mb = f"{total_size_bytes / (1024 * 1024):.2f} MB"
+            
+            if fechas:
+                fecha_inicial = min(fechas).strftime("%Y-%m-%d")
+                fecha_final = max(fechas).strftime("%Y-%m-%d")
+            else:
+                fecha_inicial = "S.F."
+                fecha_final = "S.F."
+
+            row = {
+                "NÚMERO DE ORDEN": idx,
+                "CÓDIGO": codigo_serie,
+                "NOMBRE DE LA SERIE, SUBSERIE O ASUNTO": nombre_serie,
+                "NOMBRE DE LA UNIDAD DOCUMENTAL": unidad_documental,
+                "FECHAS EXTREMAS - Inicial": fecha_inicial,
+                "FECHAS EXTREMAS - Final": fecha_final,
+                "SOPORTE - Electrónico": "X",
+                "SOPORTE - Físico": "",
+                "FÍSICO - Caja": "N/A",
+                "FÍSICO - Carpeta": "N/A",
+                "FÍSICO - Tomo/legajo/libro": "N/A",
+                "FÍSICO - Número de folios": "N/A",
+                "FÍSICO - Otro Tipo": "N/A",
+                "FÍSICO - Otro Cantidad": "N/A",
+                "ELECTRÓNICO - Ubicación": ubicacion_ruta,
+                "ELECTRÓNICO - Cantidad de documentos": cantidad_docs,
+                "ELECTRÓNICO - Tamaño": tamano_mb,
+                "NOTAS": "Generado automáticamente desde Aurora Nextcloud"
+            }
+            inventory_rows.append(row)
+            
+        return pd.DataFrame(inventory_rows), None
+    except Exception as e:
+        return None, f"Error conectando a Nextcloud: {str(e)}"
 
 # ==========================================
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
 
-st.set_page_config(page_title="Gestor de Preservación PDF v20.0", layout="wide")
+st.set_page_config(page_title="Gestor de Preservación PDF v21.0", layout="wide")
 
 col_menu, col_main = st.columns([1, 3])
 
@@ -574,7 +573,7 @@ with col_menu:
         )
 
 with col_main:
-    st.title("📄 Herramienta de Preservación Documental (v20.0)")
+    st.title("📄 Herramienta de Preservación Documental (v21.0)")
     
     if modulo == "📄 Documentos Individuales":
         
@@ -806,25 +805,28 @@ with col_main:
                             st.info("Verifica que la URL sea correcta, las credenciales sean válidas y que la ruta exista.")
 
         elif "3. Inventario Documental (FUID - AGN)" in menu_option:
-            st.subheader("📋 Generador del Formato Único de Inventario Documental (FUID)")
-            st.write("Genera el inventario archivístico oficial acorde al Acuerdo 001 de 2024 (Anexo 3) del Archivo General de la Nación[cite: 13, 14, 18].")
+            st.subheader("📋 Inventario Documental (FUID) vía Aurora Nextcloud")
+            st.write("Conéctate a la nube institucional para generar el Formato Único de Inventario Documental (Acuerdo 001 de 2024 - Anexo 3) recorriendo automáticamente las subcarpetas[cite: 13, 14, 18].")
             
-            folder_path_input = st.text_input(
-                "Ruta absoluta de la carpeta contenedora en tu equipo:",
-                placeholder=r"C:\Users\Usuario\Documents\Expedientes\100-20 Actas de Comité"
-            )
-            
-            if st.button("Generar FUID Institucional"):
-                if not folder_path_input:
-                    st.warning("⚠️ Por favor, ingresa la ruta de la carpeta.")
+            col1, col2 = st.columns(2)
+            with col1:
+                nc_url_fuid = st.text_input("URL del Servidor", value="https://cloud.insdeportescajica.gov.co", key="fuid_url")
+                nc_user_fuid = st.text_input("Usuario Nextcloud", key="fuid_user")
+            with col2:
+                nc_pass_fuid = st.text_input("Contraseña de Aplicación", type="password", key="fuid_pass")
+                nc_folder_fuid = st.text_input("Ruta de la carpeta serie/subserie", placeholder="/Archivo Central/2021/100 DIRECCION/100.2 ACTAS", key="fuid_folder")
+                
+            if st.button("Conectar y Generar FUID Institucional"):
+                if not all([nc_url_fuid, nc_user_fuid, nc_pass_fuid, nc_folder_fuid]):
+                    st.warning("⚠️ Por favor, completa todos los campos de conexión.")
                 else:
-                    with st.spinner("Analizando subcarpetas, calculando pesos y extrayendo fechas extremas de los metadatos..."):
-                        df_fuid, err = generate_fuid_inventory(folder_path_input)
+                    with st.spinner("Conectando con Aurora Nextcloud, analizando subcarpetas y leyendo metadatos de PDFs..."):
+                        df_fuid, err = generate_fuid_from_nextcloud(nc_url_fuid, nc_user_fuid, nc_pass_fuid, nc_folder_fuid)
                         
                         if err:
                             st.error(f"❌ {err}")
                         else:
-                            st.success("¡Inventario FUID generado exitosamente!")
+                            st.success("¡Inventario FUID generado exitosamente desde Aurora Nextcloud!")
                             st.dataframe(df_fuid)
                             
                             output_fuid_excel = BytesIO()
@@ -834,6 +836,6 @@ with col_main:
                             st.download_button(
                                 label="📥 Descargar FUID Oficial (.xlsx)",
                                 data=output_fuid_excel.getvalue(),
-                                file_name="Inventario_FUID_AGN.xlsx",
+                                file_name="Inventario_FUID_Nextcloud.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
