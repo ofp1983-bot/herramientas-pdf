@@ -434,13 +434,19 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 
 def generate_fuid_inventory(parent_folder_path):
     """Genera el Formato Único de Inventario Documental (FUID) basado en la estructura de carpetas"""
-    parent_path = Path(parent_folder_path)
-    if not parent_path.exists() or not parent_path.is_dir():
-        return None, "La ruta especificada no es una carpeta válida."
+    # Limpiar comillas accidentales si el usuario las copió al pegar la ruta
+    clean_path_str = parent_folder_path.strip('"').strip("'")
+    
+    parent_path = Path(clean_path_str)
+    
+    if not parent_path.exists():
+        return None, f"La ruta no existe en el disco: {clean_path_str}"
+    if not parent_path.is_dir():
+        return None, f"La ruta especificada corresponde a un archivo, no a una carpeta: {clean_path_str}"
     
     folder_name = parent_path.name
     
-    # Intentar extraer Código y Serie/Subserie del nombre de la carpeta (Ej: "100-20 Actas de Comité")
+    # Intentar extraer Código y Serie/Subserie del nombre de la carpeta
     match = re.match(r"^([\w\-\.]+)\s+(.*)$", folder_name)
     if match:
         codigo_serie = match.group(1)
@@ -452,7 +458,11 @@ def generate_fuid_inventory(parent_folder_path):
     inventory_rows = []
     
     # Listar subcarpetas (Unidades Documentales / Expedientes)
-    subfolders = [f for f in parent_path.iterdir() if f.is_dir()]
+    try:
+        subfolders = [f for f in parent_path.iterdir() if f.is_dir() and not f.name.startswith('.')]
+    except Exception as e:
+        return None, f"Error al leer los permisos de la carpeta: {str(e)}"
+        
     if not subfolders:
         # Si no hay subcarpetas, la misma carpeta principal actúa como unidad
         subfolders = [parent_path]
@@ -482,7 +492,6 @@ def generate_fuid_inventory(parent_folder_path):
                     doc.close()
                 except:
                     pass
-            # Respaldar con fecha de modificación del sistema si no hay PDF o metadatos
             try:
                 m_time = datetime.fromtimestamp(file.stat().st_mtime)
                 fechas.append(m_time)
