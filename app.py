@@ -437,11 +437,11 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
     try:
         nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
         
-        # 1. Obtener nodos de la carpeta principal
         nodos_principales = nc.files.listdir(nc_folder)
         folder_name = nc_folder.strip("/").split("/")[-1]
         
-        match = re.match(r"^([\w\-\.]+)\s+(.*)$", folder_name)
+        # Expresión regular mejorada para detectar códigos con puntos (ej: 100.2.2 o 100.2)
+        match = re.match(r"^([\d\.]+)\s+(.*)$", folder_name)
         if match:
             codigo_serie = match.group(1)
             nombre_serie = match.group(2)
@@ -451,19 +451,15 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
 
         inventory_rows = []
         
-        # Filtrar subcarpetas (Unidades Documentales)
         subcarpetas = [n for n in nodos_principales if n.is_dir]
         if not subcarpetas:
             return None, "No se encontraron subcarpetas (unidades documentales) en la ruta de Nextcloud especificada."
 
         for idx, sub_node in enumerate(subcarpetas, start=1):
             unidad_documental = sub_node.name
-            
-            # Construir la ruta de la subcarpeta de manera segura utilizando su nombre
             sub_folder_path = f"{nc_folder.rstrip('/')}/{unidad_documental}"
             ubicacion_ruta = f"{nc_url}/index.php/apps/files/?dir={sub_folder_path}"
             
-            # Listar contenido de la subcarpeta usando la ruta construida
             try:
                 nodos_internos = nc.files.listdir(sub_folder_path)
             except:
@@ -481,7 +477,6 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
                 except:
                     pass
                 
-                # Descargar en memoria para leer metadatos de fechas si es PDF
                 if file_node.name.lower().endswith(".pdf"):
                     try:
                         file_bytes = nc.files.download(file_node)
@@ -494,7 +489,6 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
                     except:
                         pass
                 
-                # Respaldar con fecha de modificación de Nextcloud si existe
                 try:
                     if hasattr(file_node, 'mtime') and file_node.mtime:
                         fechas.append(datetime.fromtimestamp(file_node.mtime))
