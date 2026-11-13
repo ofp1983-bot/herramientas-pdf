@@ -458,10 +458,17 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
 
         for idx, sub_node in enumerate(subcarpetas, start=1):
             unidad_documental = sub_node.name
-            ubicacion_ruta = f"{nc_url}/index.php/apps/files/?dir={sub_node.path}"
             
-            # Listar contenido de la subcarpeta
-            nodos_internos = nc.files.listdir(sub_node.path)
+            # Construir la ruta de la subcarpeta de manera segura utilizando su nombre
+            sub_folder_path = f"{nc_folder.rstrip('/')}/{unidad_documental}"
+            ubicacion_ruta = f"{nc_url}/index.php/apps/files/?dir={sub_folder_path}"
+            
+            # Listar contenido de la subcarpeta usando la ruta construida
+            try:
+                nodos_internos = nc.files.listdir(sub_folder_path)
+            except:
+                nodos_internos = []
+                
             archivos_internos = [n for n in nodos_internos if not n.is_dir]
             cantidad_docs = len(archivos_internos)
             
