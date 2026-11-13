@@ -437,10 +437,14 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
     try:
         nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
         
-        nodos_principales = nc.files.listdir(nc_folder)
-        folder_name = nc_folder.strip("/").split("/")[-1]
+        # Normalizar barras invertidas a barras normales para evitar errores con rutas pegadas
+        nc_folder_clean = nc.replace("\\", "/").strip() if isinstance(nc_folder, str) else nc_folder
+        # Nota: Asegurarnos de usar nc_folder directamente:
+        nc_folder_clean = nc_folder.replace("\\", "/").strip()
         
-        # Expresión regular mejorada para detectar códigos con puntos (ej: 100.2.2 o 100.2)
+        nodos_principales = nc.files.listdir(nc_folder_clean)
+        folder_name = nc_folder_clean.strip("/").split("/")[-1]
+        
         match = re.match(r"^([\d\.]+)\s+(.*)$", folder_name)
         if match:
             codigo_serie = match.group(1)
@@ -450,14 +454,13 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
             nombre_serie = folder_name
 
         inventory_rows = []
-        
         subcarpetas = [n for n in nodos_principales if n.is_dir]
         if not subcarpetas:
             return None, "No se encontraron subcarpetas (unidades documentales) en la ruta de Nextcloud especificada."
 
         for idx, sub_node in enumerate(subcarpetas, start=1):
             unidad_documental = sub_node.name
-            sub_folder_path = f"{nc_folder.rstrip('/')}/{unidad_documental}"
+            sub_folder_path = f"{nc_folder_clean.rstrip('/')}/{unidad_documental}"
             ubicacion_ruta = f"{nc_url}/index.php/apps/files/?dir={sub_folder_path}"
             
             try:
