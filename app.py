@@ -435,12 +435,10 @@ def generate_electronic_index(archivos, origen_default="Digitalizado"):
 def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
     """Genera el Formato Único de Inventario Documental (FUID) conectándose a Nextcloud"""
     try:
-        nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
+        # Limpiar y normalizar la ruta de texto antes de conectar
+        nc_folder_clean = nc_folder.replace("\\", "/").strip() if nc_folder else ""
         
-        # Normalizar barras invertidas a barras normales para evitar errores con rutas pegadas
-        nc_folder_clean = nc.replace("\\", "/").strip() if isinstance(nc_folder, str) else nc_folder
-        # Nota: Asegurarnos de usar nc_folder directamente:
-        nc_folder_clean = nc_folder.replace("\\", "/").strip()
+        nc = Nextcloud(nextcloud_url=nc_url, nc_auth_user=nc_user, nc_auth_pass=nc_pass)
         
         nodos_principales = nc.files.listdir(nc_folder_clean)
         folder_name = nc_folder_clean.strip("/").split("/")[-1]
@@ -532,7 +530,7 @@ def generate_fuid_from_nextcloud(nc_url, nc_user, nc_pass, nc_folder):
         return pd.DataFrame(inventory_rows), None
     except Exception as e:
         return None, f"Error conectando a Nextcloud: {str(e)}"
-
+        
 # ==========================================
 # INTERFAZ WEB CON STREAMLIT
 # ==========================================
